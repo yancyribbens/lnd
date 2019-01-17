@@ -75,10 +75,10 @@ $ MINING_ADDRESS=<alice_address> docker-compose up -d btcd
 
 # Generate 400 blocks (we need at least "100 >=" blocks because of coinbase 
 # block maturity and "300 ~=" in order to activate segwit):
-$ docker-compose run btcctl generate 400
+$ docker exec -it btcd /start-btcctl.sh generate 400
 
 # Check that segwit is active:
-$ docker-compose run btcctl getblockchaininfo | grep -A 1 segwit
+$ docker exec -it btcd /start-btcctl.sh getblockchaininfo | grep -A 1 segwit
 ```
 
 Check `Alice` balance:
@@ -159,7 +159,7 @@ Create the `Alice<->Bob` channel.
 alice$ lncli --network=simnet openchannel --node_key=<bob_identity_pubkey> --local_amt=1000000
 
 # Include funding transaction in block thereby opening the channel:
-$ docker-compose run btcctl generate 3
+$ docker exec -it btcd /start-btcctl.sh generate 3
 
 # Check that channel with "Bob" was opened:
 alice$ lncli --network=simnet listchannels
@@ -243,7 +243,7 @@ alice$ lncli --network=simnet listchannels
 alice$ lncli --network=simnet closechannel --funding_txid=<funding_txid> --output_index=<output_index>
 
 # Include close transaction in a block thereby closing the channel:
-$ docker-compose run btcctl generate 3
+$ docker exec -it btcd /start-btcctl.sh generate 3
 
 # Check "Alice" on-chain balance was credited by her settled amount in the channel:
 alice$ lncli --network=simnet walletbalance
