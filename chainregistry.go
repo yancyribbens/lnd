@@ -25,6 +25,7 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs/neutrinonotify"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/htlcswitch"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/btcwallet"
@@ -63,14 +64,14 @@ const (
 // TODO(halseth): make configurable at startup?
 var defaultBtcChannelConstraints = channeldb.ChannelConstraints{
 	DustLimit:        lnwallet.DefaultDustLimit(),
-	MaxAcceptedHtlcs: lnwallet.MaxHTLCNumber / 2,
+	MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
 }
 
 // defaultLtcChannelConstraints is the default set of channel constraints that are
 // meant to be used when initially funding a Litecoin channel.
 var defaultLtcChannelConstraints = channeldb.ChannelConstraints{
 	DustLimit:        defaultLitecoinDustLimit,
-	MaxAcceptedHtlcs: lnwallet.MaxHTLCNumber / 2,
+	MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
 }
 
 // chainCode is an enum-like structure for keeping track of the chains
@@ -105,7 +106,7 @@ type chainControl struct {
 
 	feeEstimator lnwallet.FeeEstimator
 
-	signer lnwallet.Signer
+	signer input.Signer
 
 	keyRing keychain.KeyRing
 
@@ -249,21 +250,22 @@ func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB,
 		neutrino.BanDuration = 5 * time.Second
 		svc, err := neutrino.NewChainService(config)
 		if err != nil {
+			nodeDatabase.Close()
 			return nil, nil, fmt.Errorf("unable to create neutrino: %v", err)
 		}
 		svc.Start()
+		cleanUp = func() {
+			svc.Stop()
+			nodeDatabase.Close()
+		}
 
 		// Next we'll create the instances of the ChainNotifier and
 		// FilteredChainView interface which is backed by the neutrino
 		// light client.
-		cc.chainNotifier, err = neutrinonotify.New(
-			svc, hintCache, hintCache,
-		)
-		if err != nil {
-			return nil, nil, err
-		}
+		cc.chainNotifier = neutrinonotify.New(svc, hintCache, hintCache)
 		cc.chainView, err = chainview.NewCfFilteredChainView(svc)
 		if err != nil {
+			cleanUp()
 			return nil, nil, err
 		}
 
@@ -273,10 +275,6 @@ func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB,
 		walletConfig.ChainSource = chain.NewNeutrinoClient(
 			activeNetParams.Params, svc,
 		)
-		cleanUp = func() {
-			svc.Stop()
-			nodeDatabase.Close()
-		}
 	case "bitcoind", "litecoind":
 		var bitcoindMode *bitcoindConfig
 		switch {
@@ -336,7 +334,7 @@ func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB,
 		}
 
 		cc.chainNotifier = bitcoindnotify.New(
-			bitcoindConn, hintCache, hintCache,
+			bitcoindConn, activeNetParams.Params, hintCache, hintCache,
 		)
 		cc.chainView = chainview.NewBitcoindFilteredChainView(bitcoindConn)
 		walletConfig.ChainSource = bitcoindConn.NewBitcoindClient()
@@ -446,7 +444,7 @@ func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB,
 			DisableAutoReconnect: false,
 		}
 		cc.chainNotifier, err = btcdnotify.New(
-			rpcConfig, hintCache, hintCache,
+			rpcConfig, activeNetParams.Params, hintCache, hintCache,
 		)
 		if err != nil {
 			return nil, nil, err
@@ -500,6 +498,9 @@ func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB,
 	wc, err := btcwallet.New(*walletConfig)
 	if err != nil {
 		fmt.Printf("unable to create wallet controller: %v\n", err)
+		if cleanUp != nil {
+			cleanUp()
+		}
 		return nil, nil, err
 	}
 
@@ -535,10 +536,16 @@ func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB,
 	lnWallet, err := lnwallet.NewLightningWallet(walletCfg)
 	if err != nil {
 		fmt.Printf("unable to create wallet: %v\n", err)
+		if cleanUp != nil {
+			cleanUp()
+		}
 		return nil, nil, err
 	}
 	if err := lnWallet.Startup(); err != nil {
 		fmt.Printf("unable to start wallet: %v\n", err)
+		if cleanUp != nil {
+			cleanUp()
+		}
 		return nil, nil, err
 	}
 

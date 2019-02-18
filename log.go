@@ -10,17 +10,19 @@ import (
 	"github.com/btcsuite/btclog"
 	"github.com/jrick/logrotate/rotator"
 	"github.com/lightninglabs/neutrino"
-
 	"github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/channelnotifier"
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/discovery"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnrpc/autopilotrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/chainrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -77,6 +79,9 @@ var (
 	invcLog = build.NewSubLogger("INVC", backendLog.Logger)
 	nannLog = build.NewSubLogger("NANN", backendLog.Logger)
 	wtwrLog = build.NewSubLogger("WTWR", backendLog.Logger)
+	ntfrLog = build.NewSubLogger("NTFR", backendLog.Logger)
+	irpcLog = build.NewSubLogger("IRPC", backendLog.Logger)
+	chnfLog = build.NewSubLogger("CHNF", backendLog.Logger)
 )
 
 // Initialize package-global logger variables.
@@ -100,6 +105,9 @@ func init() {
 	invoices.UseLogger(invcLog)
 	netann.UseLogger(nannLog)
 	watchtower.UseLogger(wtwrLog)
+	chainrpc.UseLogger(ntfrLog)
+	invoicesrpc.UseLogger(irpcLog)
+	channelnotifier.UseLogger(chnfLog)
 }
 
 // subsystemLoggers maps each subsystem identifier to its associated logger.
@@ -129,6 +137,9 @@ var subsystemLoggers = map[string]btclog.Logger{
 	"INVC": invcLog,
 	"NANN": nannLog,
 	"WTWR": wtwrLog,
+	"NTFR": ntfnLog,
+	"IRPC": irpcLog,
+	"CHNF": chnfLog,
 }
 
 // initLogRotator initializes the logging rotator to write logs to logFile and

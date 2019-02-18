@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/connmgr"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcutil"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/watchtower/blob"
@@ -50,6 +52,9 @@ type Config struct {
 	// NewAddress is used to generate reward addresses, where a cut of
 	// successfully sent funds can be received.
 	NewAddress func() (btcutil.Address, error)
+
+	// ChainHash identifies the network that the server is watching.
+	ChainHash chainhash.Hash
 }
 
 // Server houses the state required to handle watchtower peers. It's primary job
@@ -66,8 +71,7 @@ type Server struct {
 	clientMtx sync.RWMutex
 	clients   map[wtdb.SessionID]Peer
 
-	globalFeatures *lnwire.RawFeatureVector
-	localFeatures  *lnwire.RawFeatureVector
+	localInit *wtwire.Init
 
 	wg   sync.WaitGroup
 	quit chan struct{}
@@ -77,16 +81,16 @@ type Server struct {
 // clients connecting to the listener addresses, and allows them to open
 // sessions and send state updates.
 func New(cfg *Config) (*Server, error) {
-	localFeatures := lnwire.NewRawFeatureVector(
-		wtwire.WtSessionsOptional,
+	localInit := wtwire.NewInitMessage(
+		lnwire.NewRawFeatureVector(wtwire.WtSessionsOptional),
+		cfg.ChainHash,
 	)
 
 	s := &Server{
-		cfg:            cfg,
-		clients:        make(map[wtdb.SessionID]Peer),
-		globalFeatures: lnwire.NewRawFeatureVector(),
-		localFeatures:  localFeatures,
-		quit:           make(chan struct{}),
+		cfg:       cfg,
+		clients:   make(map[wtdb.SessionID]Peer),
+		localInit: localInit,
+		quit:      make(chan struct{}),
 	}
 
 	connMgr, err := connmgr.New(&connmgr.Config{
@@ -204,17 +208,14 @@ func (s *Server) handleClient(peer Peer) {
 		return
 	}
 
-	localInit := wtwire.NewInitMessage(
-		s.localFeatures, s.globalFeatures,
-	)
-
-	err = s.sendMessage(peer, localInit)
+	err = s.sendMessage(peer, s.localInit)
 	if err != nil {
 		log.Errorf("Unable to send Init msg to %s: %v", id, err)
 		return
 	}
 
-	if err = s.handleInit(localInit, remoteInit); err != nil {
+	err = s.localInit.CheckRemoteInit(remoteInit, wtwire.FeatureNames)
+	if err != nil {
 		log.Errorf("Cannot support client %s: %v", id, err)
 		return
 	}
@@ -292,33 +293,6 @@ func (s *Server) handleClient(peer Peer) {
 	}
 }
 
-// handleInit accepts the local and remote Init messages, and verifies that the
-// client is not requesting any required features that are unknown to the tower.
-func (s *Server) handleInit(localInit, remoteInit *wtwire.Init) error {
-	remoteLocalFeatures := lnwire.NewFeatureVector(
-		remoteInit.LocalFeatures, wtwire.LocalFeatures,
-	)
-	remoteGlobalFeatures := lnwire.NewFeatureVector(
-		remoteInit.GlobalFeatures, wtwire.GlobalFeatures,
-	)
-
-	unknownLocalFeatures := remoteLocalFeatures.UnknownRequiredFeatures()
-	if len(unknownLocalFeatures) > 0 {
-		err := fmt.Errorf("Peer set unknown local feature bits: %v",
-			unknownLocalFeatures)
-		return err
-	}
-
-	unknownGlobalFeatures := remoteGlobalFeatures.UnknownRequiredFeatures()
-	if len(unknownGlobalFeatures) > 0 {
-		err := fmt.Errorf("Peer set unknown global feature bits: %v",
-			unknownGlobalFeatures)
-		return err
-	}
-
-	return nil
-}
-
 // handleCreateSession processes a CreateSession message from the peer, and returns
 // a CreateSessionReply in response. This method will only succeed if no existing
 // session info is known about the session id. If an existing session is found,
@@ -340,7 +314,7 @@ func (s *Server) handleCreateSession(peer Peer, id *wtdb.SessionID,
 		log.Debugf("Already have session for %s", id)
 		return s.replyCreateSession(
 			peer, id, wtwire.CreateSessionCodeAlreadyExists,
-			[]byte(existingInfo.RewardAddress),
+			existingInfo.RewardAddress,
 		)
 
 	// Some other database error occurred, return a temporary failure.
@@ -364,7 +338,15 @@ func (s *Server) handleCreateSession(peer Peer, id *wtdb.SessionID,
 		)
 	}
 
-	rewardAddrBytes := rewardAddress.ScriptAddress()
+	// Construct the pkscript the client should pay to when signing justice
+	// transactions for this session.
+	rewardScript, err := txscript.PayToAddrScript(rewardAddress)
+	if err != nil {
+		log.Errorf("unable to generate reward script for %s", id)
+		return s.replyCreateSession(
+			peer, id, wtwire.CodeTemporaryFailure, nil,
+		)
+	}
 
 	// Ensure that the requested blob type is supported by our tower.
 	if !blob.IsSupportedType(req.BlobType) {
@@ -380,14 +362,15 @@ func (s *Server) handleCreateSession(peer Peer, id *wtdb.SessionID,
 	// Assemble the session info using the agreed upon parameters, reward
 	// address, and session id.
 	info := wtdb.SessionInfo{
-		ID:            *id,
-		RewardAddress: rewardAddrBytes,
+		ID: *id,
 		Policy: wtpolicy.Policy{
 			BlobType:     req.BlobType,
 			MaxUpdates:   req.MaxUpdates,
+			RewardBase:   req.RewardBase,
 			RewardRate:   req.RewardRate,
 			SweepFeeRate: req.SweepFeeRate,
 		},
+		RewardAddress: rewardScript,
 	}
 
 	// Insert the session info into the watchtower's database. If
@@ -403,7 +386,7 @@ func (s *Server) handleCreateSession(peer Peer, id *wtdb.SessionID,
 	log.Infof("Accepted session for %s", id)
 
 	return s.replyCreateSession(
-		peer, id, wtwire.CodeOK, rewardAddrBytes,
+		peer, id, wtwire.CodeOK, rewardScript,
 	)
 }
 

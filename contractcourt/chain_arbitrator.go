@@ -6,15 +6,16 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/lightningnetwork/lnd/sweep"
-
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/sweep"
 )
 
 // ErrChainArbExiting signals that the chain arbitrator is shutting down.
@@ -121,7 +122,7 @@ type ChainArbitratorConfig struct {
 	// Signer is a signer backed by the active lnd node. This should be
 	// capable of producing a signature as specified by a valid
 	// SignDescriptor.
-	Signer lnwallet.Signer
+	Signer input.Signer
 
 	// FeeEstimator will be used to return fee estimates.
 	FeeEstimator lnwallet.FeeEstimator
@@ -135,6 +136,15 @@ type ChainArbitratorConfig struct {
 
 	// Sweeper allows resolvers to sweep their final outputs.
 	Sweeper *sweep.UtxoSweeper
+
+	// SettleInvoice attempts to settle an existing invoice on-chain with
+	// the given payment hash. ErrInvoiceNotFound is returned if an invoice
+	// is not found.
+	SettleInvoice func(lntypes.Hash, lnwire.MilliSatoshi) error
+
+	// NotifyClosedChannel is a function closure that the ChainArbitrator
+	// will use to notify the ChannelNotifier about a newly closed channel.
+	NotifyClosedChannel func(wire.OutPoint)
 }
 
 // ChainArbitrator is a sub-system that oversees the on-chain resolution of all
@@ -220,22 +230,9 @@ func newActiveChannelArbitrator(channel *channeldb.OpenChannel,
 			// With the channels fetched, attempt to locate
 			// the target channel according to its channel
 			// point.
-			dbChannels, err := c.chanSource.FetchAllChannels()
+			channel, err := c.chanSource.FetchChannel(chanPoint)
 			if err != nil {
 				return nil, err
-			}
-			var channel *channeldb.OpenChannel
-			for _, dbChannel := range dbChannels {
-				if dbChannel.FundingOutpoint == chanPoint {
-					channel = dbChannel
-					break
-				}
-			}
-
-			// If the channel cannot be located, then we
-			// exit with an error to the channel.
-			if channel == nil {
-				return nil, fmt.Errorf("unable to find channel")
 			}
 
 			chanMachine, err := lnwallet.NewLightningChannel(
@@ -252,10 +249,16 @@ func newActiveChannelArbitrator(channel *channeldb.OpenChannel,
 			return chanMachine.ForceClose()
 		},
 		MarkCommitmentBroadcasted: channel.MarkCommitmentBroadcasted,
-		MarkChannelClosed:         channel.CloseChannel,
-		IsPendingClose:            false,
-		ChainArbitratorConfig:     c.cfg,
-		ChainEvents:               chanEvents,
+		MarkChannelClosed: func(summary *channeldb.ChannelCloseSummary) error {
+			if err := channel.CloseChannel(summary); err != nil {
+				return err
+			}
+			c.cfg.NotifyClosedChannel(summary.ChanPoint)
+			return nil
+		},
+		IsPendingClose:        false,
+		ChainArbitratorConfig: c.cfg,
+		ChainEvents:           chanEvents,
 	}
 
 	// The final component needed is an arbitrator log that the arbitrator
@@ -574,6 +577,21 @@ func (c *ChainArbitrator) UpdateContractSignals(chanPoint wire.OutPoint,
 	return nil
 }
 
+// GetChannelArbitrator safely returns the channel arbitrator for a given
+// channel outpoint.
+func (c *ChainArbitrator) GetChannelArbitrator(chanPoint wire.OutPoint) (
+	*ChannelArbitrator, error) {
+
+	c.Lock()
+	arbitrator, ok := c.activeChannels[chanPoint]
+	c.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("unable to find arbitrator")
+	}
+
+	return arbitrator, nil
+}
+
 // forceCloseReq is a request sent from an outside sub-system to the arbitrator
 // that watches a particular channel to broadcast the commitment transaction,
 // and enter the resolution phase of the channel.
@@ -711,13 +729,7 @@ func (c *ChainArbitrator) WatchNewChannel(newChan *channeldb.OpenChannel) error 
 // SubscribeChannelEvents returns a new active subscription for the set of
 // possible on-chain events for a particular channel. The struct can be used by
 // callers to be notified whenever an event that changes the state of the
-// channel on-chain occurs. If syncDispatch is true, then the sender of the
-// notification will wait until an error is sent over the ProcessACK before
-// modifying any database state. This allows callers to request a reliable hand
-// off.
-//
-// TODO(roasbeef): can be used later to provide RPC hook for all channel
-// lifetimes
+// channel on-chain occurs.
 func (c *ChainArbitrator) SubscribeChannelEvents(
 	chanPoint wire.OutPoint) (*ChainEventSubscription, error) {
 

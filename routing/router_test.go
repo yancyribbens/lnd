@@ -9,14 +9,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/htlcswitch"
-
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
-	"github.com/lightningnetwork/lightning-onion"
+
+	sphinx "github.com/lightningnetwork/lightning-onion"
+	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
@@ -550,7 +550,8 @@ func TestSendPaymentErrorRepeatedFeeInsufficient(t *testing.T) {
 	errChanUpdate := lnwire.ChannelUpdate{
 		ShortChannelID:  lnwire.NewShortChanIDFromInt(chanID),
 		Timestamp:       uint32(edgeUpateToFail.LastUpdate.Unix()),
-		Flags:           edgeUpateToFail.Flags,
+		MessageFlags:    edgeUpateToFail.MessageFlags,
+		ChannelFlags:    edgeUpateToFail.ChannelFlags,
 		TimeLockDelta:   edgeUpateToFail.TimeLockDelta,
 		HtlcMinimumMsat: edgeUpateToFail.MinHTLC,
 		BaseFee:         uint32(edgeUpateToFail.FeeBaseMSat),
@@ -656,7 +657,8 @@ func TestSendPaymentErrorNonFinalTimeLockErrors(t *testing.T) {
 	errChanUpdate := lnwire.ChannelUpdate{
 		ShortChannelID:  lnwire.NewShortChanIDFromInt(chanID),
 		Timestamp:       uint32(edgeUpateToFail.LastUpdate.Unix()),
-		Flags:           edgeUpateToFail.Flags,
+		MessageFlags:    edgeUpateToFail.MessageFlags,
+		ChannelFlags:    edgeUpateToFail.ChannelFlags,
 		TimeLockDelta:   edgeUpateToFail.TimeLockDelta,
 		HtlcMinimumMsat: edgeUpateToFail.MinHTLC,
 		BaseFee:         uint32(edgeUpateToFail.FeeBaseMSat),
@@ -1023,6 +1025,86 @@ func TestIgnoreNodeAnnouncement(t *testing.T) {
 	}
 }
 
+// TestIgnoreChannelEdgePolicyForUnknownChannel checks that a router will
+// ignore a channel policy for a channel not in the graph.
+func TestIgnoreChannelEdgePolicyForUnknownChannel(t *testing.T) {
+	t.Parallel()
+
+	const startingBlockHeight = 101
+
+	// Setup an initially empty network.
+	testChannels := []*testChannel{}
+	testGraph, err := createTestGraphFromChannels(testChannels)
+	if err != nil {
+		t.Fatalf("unable to create graph: %v", err)
+	}
+	defer testGraph.cleanUp()
+
+	ctx, cleanUp, err := createTestCtxFromGraphInstance(
+		startingBlockHeight, testGraph,
+	)
+	if err != nil {
+		t.Fatalf("unable to create router: %v", err)
+	}
+	defer cleanUp()
+
+	var pub1 [33]byte
+	copy(pub1[:], priv1.PubKey().SerializeCompressed())
+
+	var pub2 [33]byte
+	copy(pub2[:], priv2.PubKey().SerializeCompressed())
+
+	// Add the edge between the two unknown nodes to the graph, and check
+	// that the nodes are found after the fact.
+	fundingTx, _, chanID, err := createChannelEdge(
+		ctx, bitcoinKey1.SerializeCompressed(),
+		bitcoinKey2.SerializeCompressed(), 10000, 500,
+	)
+	if err != nil {
+		t.Fatalf("unable to create channel edge: %v", err)
+	}
+	fundingBlock := &wire.MsgBlock{
+		Transactions: []*wire.MsgTx{fundingTx},
+	}
+	ctx.chain.addBlock(fundingBlock, chanID.BlockHeight, chanID.BlockHeight)
+
+	edge := &channeldb.ChannelEdgeInfo{
+		ChannelID:        chanID.ToUint64(),
+		NodeKey1Bytes:    pub1,
+		NodeKey2Bytes:    pub2,
+		BitcoinKey1Bytes: pub1,
+		BitcoinKey2Bytes: pub2,
+		AuthProof:        nil,
+	}
+	edgePolicy := &channeldb.ChannelEdgePolicy{
+		SigBytes:                  testSig.Serialize(),
+		ChannelID:                 edge.ChannelID,
+		LastUpdate:                testTime,
+		TimeLockDelta:             10,
+		MinHTLC:                   1,
+		FeeBaseMSat:               10,
+		FeeProportionalMillionths: 10000,
+	}
+
+	// Attempt to update the edge. This should be ignored, since the edge
+	// is not yet added to the router.
+	err = ctx.router.UpdateEdge(edgePolicy)
+	if !IsError(err, ErrIgnored) {
+		t.Fatalf("expected to get ErrIgnore, instead got: %v", err)
+	}
+
+	// Add the edge.
+	if err := ctx.router.AddEdge(edge); err != nil {
+		t.Fatalf("expected to be able to add edge to the channel graph,"+
+			" even though the vertexes were unknown: %v.", err)
+	}
+
+	// Now updating the edge policy should succeed.
+	if err := ctx.router.UpdateEdge(edgePolicy); err != nil {
+		t.Fatalf("unable to update edge policy: %v", err)
+	}
+}
+
 // TestAddEdgeUnknownVertexes tests that if an edge is added that contains two
 // vertexes which we don't know of, the edge should be available for use
 // regardless. This is due to the fact that we don't actually need node
@@ -1098,7 +1180,7 @@ func TestAddEdgeUnknownVertexes(t *testing.T) {
 		FeeBaseMSat:               10,
 		FeeProportionalMillionths: 10000,
 	}
-	edgePolicy.Flags = 0
+	edgePolicy.ChannelFlags = 0
 
 	if err := ctx.router.UpdateEdge(edgePolicy); err != nil {
 		t.Fatalf("unable to update edge policy: %v", err)
@@ -1114,7 +1196,7 @@ func TestAddEdgeUnknownVertexes(t *testing.T) {
 		FeeBaseMSat:               10,
 		FeeProportionalMillionths: 10000,
 	}
-	edgePolicy.Flags = 1
+	edgePolicy.ChannelFlags = 1
 
 	if err := ctx.router.UpdateEdge(edgePolicy); err != nil {
 		t.Fatalf("unable to update edge policy: %v", err)
@@ -1194,7 +1276,7 @@ func TestAddEdgeUnknownVertexes(t *testing.T) {
 		FeeBaseMSat:               10,
 		FeeProportionalMillionths: 10000,
 	}
-	edgePolicy.Flags = 0
+	edgePolicy.ChannelFlags = 0
 
 	if err := ctx.router.UpdateEdge(edgePolicy); err != nil {
 		t.Fatalf("unable to update edge policy: %v", err)
@@ -1209,7 +1291,7 @@ func TestAddEdgeUnknownVertexes(t *testing.T) {
 		FeeBaseMSat:               10,
 		FeeProportionalMillionths: 10000,
 	}
-	edgePolicy.Flags = 1
+	edgePolicy.ChannelFlags = 1
 
 	if err := ctx.router.UpdateEdge(edgePolicy); err != nil {
 		t.Fatalf("unable to update edge policy: %v", err)
@@ -2099,7 +2181,7 @@ func TestIsStaleEdgePolicy(t *testing.T) {
 		FeeBaseMSat:               10,
 		FeeProportionalMillionths: 10000,
 	}
-	edgePolicy.Flags = 0
+	edgePolicy.ChannelFlags = 0
 	if err := ctx.router.UpdateEdge(edgePolicy); err != nil {
 		t.Fatalf("unable to update edge policy: %v", err)
 	}
@@ -2113,7 +2195,7 @@ func TestIsStaleEdgePolicy(t *testing.T) {
 		FeeBaseMSat:               10,
 		FeeProportionalMillionths: 10000,
 	}
-	edgePolicy.Flags = 1
+	edgePolicy.ChannelFlags = 1
 	if err := ctx.router.UpdateEdge(edgePolicy); err != nil {
 		t.Fatalf("unable to update edge policy: %v", err)
 	}

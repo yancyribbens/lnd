@@ -198,7 +198,7 @@ type peer struct {
 	// messages to write out directly on the socket. By re-using this
 	// buffer, we avoid needing to allocate more memory each time a new
 	// message is to be sent to a peer.
-	writeBuf [lnwire.MaxMessagePayload]byte
+	writeBuf *lnpeer.WriteBuffer
 
 	queueQuit chan struct{}
 	quit      chan struct{}
@@ -238,6 +238,8 @@ func newPeer(conn net.Conn, connReq *connmgr.ConnReq, server *server,
 		linkFailures:       make(chan linkFailureReport),
 		chanCloseMsgs:      make(chan *closeMsg),
 		failedChannels:     make(map[lnwire.ChannelID]struct{}),
+
+		writeBuf: server.writeBufferPool.Take(),
 
 		queueQuit: make(chan struct{}),
 		quit:      make(chan struct{}),
@@ -409,7 +411,7 @@ func (p *peer) loadActiveChannels(chans []*channeldb.OpenChannel) error {
 
 		// Skip adding any permanently irreconcilable channels to the
 		// htlcswitch.
-		if dbChan.ChanStatus() != channeldb.Default {
+		if dbChan.ChanStatus() != channeldb.ChanStatusDefault {
 			peerLog.Warnf("ChannelPoint(%v) has status %v, won't "+
 				"start.", chanPoint, dbChan.ChanStatus())
 			continue
@@ -613,6 +615,11 @@ func (p *peer) WaitForDisconnect(ready chan struct{}) {
 	}
 
 	p.wg.Wait()
+
+	// Now that we are certain all active goroutines which could have been
+	// modifying the write buffer have exited, return the buffer to the pool
+	// to be reused.
+	p.server.writeBufferPool.Return(p.writeBuf)
 }
 
 // Disconnect terminates the connection with the remote peer. Additionally, a
@@ -958,9 +965,9 @@ func (p *peer) readHandler() {
 		p.Disconnect(err)
 	})
 
-	// Initialize our negotiated gossip sync method before reading
-	// messages off the wire. When using gossip queries, this ensures
-	// a gossip syncer is active by the time query messages arrive.
+	// Initialize our negotiated gossip sync method before reading messages
+	// off the wire. When using gossip queries, this ensures a gossip
+	// syncer is active by the time query messages arrive.
 	//
 	// TODO(conner): have peer store gossip syncer directly and bypass
 	// gossiper?
@@ -1235,10 +1242,10 @@ func messageSummary(msg lnwire.Message) string {
 			msg.ChainHash, msg.ShortChannelID.ToUint64())
 
 	case *lnwire.ChannelUpdate:
-		return fmt.Sprintf("chain_hash=%v, short_chan_id=%v, flag=%v, "+
-			"update_time=%v", msg.ChainHash,
-			msg.ShortChannelID.ToUint64(), msg.Flags,
-			time.Unix(int64(msg.Timestamp), 0))
+		return fmt.Sprintf("chain_hash=%v, short_chan_id=%v, "+
+			"mflags=%v, cflags=%v, update_time=%v", msg.ChainHash,
+			msg.ShortChannelID.ToUint64(), msg.MessageFlags,
+			msg.ChannelFlags, time.Unix(int64(msg.Timestamp), 0))
 
 	case *lnwire.NodeAnnouncement:
 		return fmt.Sprintf("node=%x, update_time=%v",
@@ -2146,23 +2153,33 @@ func (p *peer) WipeChannel(chanPoint *wire.OutPoint) error {
 // handleInitMsg handles the incoming init message which contains global and
 // local features vectors. If feature vectors are incompatible then disconnect.
 func (p *peer) handleInitMsg(msg *lnwire.Init) error {
-	p.remoteLocalFeatures = lnwire.NewFeatureVector(msg.LocalFeatures,
-		lnwire.LocalFeatures)
-	p.remoteGlobalFeatures = lnwire.NewFeatureVector(msg.GlobalFeatures,
-		lnwire.GlobalFeatures)
+	p.remoteLocalFeatures = lnwire.NewFeatureVector(
+		msg.LocalFeatures, lnwire.LocalFeatures,
+	)
+	p.remoteGlobalFeatures = lnwire.NewFeatureVector(
+		msg.GlobalFeatures, lnwire.GlobalFeatures,
+	)
 
+	// Now that we have their features loaded, we'll ensure that they
+	// didn't set any required bits that we don't know of.
 	unknownLocalFeatures := p.remoteLocalFeatures.UnknownRequiredFeatures()
 	if len(unknownLocalFeatures) > 0 {
 		err := fmt.Errorf("Peer set unknown local feature bits: %v",
 			unknownLocalFeatures)
 		return err
 	}
-
 	unknownGlobalFeatures := p.remoteGlobalFeatures.UnknownRequiredFeatures()
 	if len(unknownGlobalFeatures) > 0 {
 		err := fmt.Errorf("Peer set unknown global feature bits: %v",
 			unknownGlobalFeatures)
 		return err
+	}
+
+	// Now that we know we understand their requirements, we'll check to
+	// see if they don't support anything that we deem to be mandatory.
+	switch {
+	case !p.remoteLocalFeatures.HasFeature(lnwire.DataLossProtectRequired):
+		return fmt.Errorf("data loss protection required")
 	}
 
 	return nil

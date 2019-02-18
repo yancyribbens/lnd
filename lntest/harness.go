@@ -1,6 +1,7 @@
 package lntest
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -1155,6 +1156,28 @@ func WaitPredicate(pred func() bool, timeout time.Duration) error {
 	}
 }
 
+// WaitNoError is a wrapper around WaitPredicate that waits for the passed
+// method f to execute without error, and returns the last error encountered if
+// this doesn't happen within the timeout.
+func WaitNoError(f func() error, timeout time.Duration) error {
+	var predErr error
+	pred := func() bool {
+		if err := f(); err != nil {
+			predErr = err
+			return false
+		}
+		return true
+	}
+
+	// If f() doesn't succeed within the timeout, return the last
+	// encountered error.
+	if err := WaitPredicate(pred, timeout); err != nil {
+		return predErr
+	}
+
+	return nil
+}
+
 // WaitInvariant is a helper test function that will wait for a timeout period
 // of time, verifying that a statement remains true for the entire duration.
 // This function is helpful as timing doesn't always line up well when running
@@ -1275,11 +1298,46 @@ func (n *NetworkHarness) sendCoins(ctx context.Context, amt btcutil.Amount,
 		return err
 	}
 
+	// Encode the pkScript in hex as this the format that it will be
+	// returned via rpc.
+	expPkScriptStr := hex.EncodeToString(addrScript)
+
+	// Now, wait for ListUnspent to show the unconfirmed transaction
+	// containing the correct pkscript.
+	err = WaitNoError(func() error {
+		req := &lnrpc.ListUnspentRequest{}
+		resp, err := target.ListUnspent(ctx, req)
+		if err != nil {
+			return err
+		}
+
+		// When using this method, there should only ever be on
+		// unconfirmed transaction.
+		if len(resp.Utxos) != 1 {
+			return fmt.Errorf("number of unconfirmed utxos "+
+				"should be 1, found %d", len(resp.Utxos))
+		}
+
+		// Assert that the lone unconfirmed utxo contains the same
+		// pkscript as the output generated above.
+		pkScriptStr := resp.Utxos[0].PkScript
+		if strings.Compare(pkScriptStr, expPkScriptStr) != 0 {
+			return fmt.Errorf("pkscript mismatch, want: %s, "+
+				"found: %s", expPkScriptStr, pkScriptStr)
+		}
+
+		return nil
+	}, 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("unconfirmed utxo was not found in "+
+			"ListUnspent: %v", err)
+	}
+
 	// If the transaction should remain unconfirmed, then we'll wait until
 	// the target node's unconfirmed balance reflects the expected balance
 	// and exit.
 	if !confirmed {
-		expectedBalance := initialBalance.UnconfirmedBalance + int64(amt)
+		expectedBalance := btcutil.Amount(initialBalance.UnconfirmedBalance) + amt
 		return target.WaitForBalance(expectedBalance, false)
 	}
 
@@ -1290,7 +1348,7 @@ func (n *NetworkHarness) sendCoins(ctx context.Context, amt btcutil.Amount,
 		return err
 	}
 
-	expectedBalance := initialBalance.ConfirmedBalance + int64(amt)
+	expectedBalance := btcutil.Amount(initialBalance.ConfirmedBalance) + amt
 	return target.WaitForBalance(expectedBalance, true)
 }
 

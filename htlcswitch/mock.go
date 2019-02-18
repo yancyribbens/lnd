@@ -17,13 +17,14 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/btcsuite/fastsha256"
 	"github.com/go-errors/errors"
-	"github.com/lightningnetwork/lightning-onion"
+	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/contractcourt"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnpeer"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/ticker"
@@ -161,9 +162,11 @@ func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) 
 		FetchLastChannelUpdate: func(lnwire.ShortChannelID) (*lnwire.ChannelUpdate, error) {
 			return nil, nil
 		},
-		Notifier:       &mockNotifier{},
-		FwdEventTicker: ticker.MockNew(DefaultFwdEventInterval),
-		LogEventTicker: ticker.MockNew(DefaultLogInterval),
+		Notifier:              &mockNotifier{},
+		FwdEventTicker:        ticker.NewForce(DefaultFwdEventInterval),
+		LogEventTicker:        ticker.NewForce(DefaultLogInterval),
+		NotifyActiveChannel:   func(wire.OutPoint) {},
+		NotifyInactiveChannel: func(wire.OutPoint) {},
 	}
 
 	return New(cfg, startingHeight)
@@ -672,6 +675,7 @@ func (f *mockChannelLink) ChanID() lnwire.ChannelID                     { return
 func (f *mockChannelLink) ShortChanID() lnwire.ShortChannelID           { return f.shortChanID }
 func (f *mockChannelLink) Bandwidth() lnwire.MilliSatoshi               { return 99999999 }
 func (f *mockChannelLink) Peer() lnpeer.Peer                            { return f.peer }
+func (f *mockChannelLink) ChannelPoint() *wire.OutPoint                 { return &wire.OutPoint{} }
 func (f *mockChannelLink) Stop()                                        {}
 func (f *mockChannelLink) EligibleToForward() bool                      { return f.eligible }
 func (f *mockChannelLink) setLiveShortChanID(sid lnwire.ShortChannelID) { f.shortChanID = sid }
@@ -685,18 +689,18 @@ var _ ChannelLink = (*mockChannelLink)(nil)
 type mockInvoiceRegistry struct {
 	sync.Mutex
 
-	invoices   map[chainhash.Hash]channeldb.Invoice
+	invoices   map[lntypes.Hash]channeldb.Invoice
 	finalDelta uint32
 }
 
 func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
 	return &mockInvoiceRegistry{
 		finalDelta: minDelta,
-		invoices:   make(map[chainhash.Hash]channeldb.Invoice),
+		invoices:   make(map[lntypes.Hash]channeldb.Invoice),
 	}
 }
 
-func (i *mockInvoiceRegistry) LookupInvoice(rHash chainhash.Hash) (channeldb.Invoice, uint32, error) {
+func (i *mockInvoiceRegistry) LookupInvoice(rHash lntypes.Hash) (channeldb.Invoice, uint32, error) {
 	i.Lock()
 	defer i.Unlock()
 
@@ -709,7 +713,7 @@ func (i *mockInvoiceRegistry) LookupInvoice(rHash chainhash.Hash) (channeldb.Inv
 	return invoice, i.finalDelta, nil
 }
 
-func (i *mockInvoiceRegistry) SettleInvoice(rhash chainhash.Hash,
+func (i *mockInvoiceRegistry) SettleInvoice(rhash lntypes.Hash,
 	amt lnwire.MilliSatoshi) error {
 
 	i.Lock()
@@ -731,12 +735,31 @@ func (i *mockInvoiceRegistry) SettleInvoice(rhash chainhash.Hash,
 	return nil
 }
 
+func (i *mockInvoiceRegistry) CancelInvoice(payHash lntypes.Hash) error {
+	i.Lock()
+	defer i.Unlock()
+
+	invoice, ok := i.invoices[payHash]
+	if !ok {
+		return channeldb.ErrInvoiceNotFound
+	}
+
+	if invoice.Terms.State == channeldb.ContractCanceled {
+		return nil
+	}
+
+	invoice.Terms.State = channeldb.ContractCanceled
+	i.invoices[payHash] = invoice
+
+	return nil
+}
+
 func (i *mockInvoiceRegistry) AddInvoice(invoice channeldb.Invoice) error {
 	i.Lock()
 	defer i.Unlock()
 
-	rhash := fastsha256.Sum256(invoice.Terms.PaymentPreimage[:])
-	i.invoices[chainhash.Hash(rhash)] = invoice
+	rhash := invoice.Terms.PaymentPreimage.Hash()
+	i.invoices[rhash] = invoice
 
 	return nil
 }
@@ -747,7 +770,7 @@ type mockSigner struct {
 	key *btcec.PrivateKey
 }
 
-func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx, signDesc *lnwallet.SignDescriptor) ([]byte, error) {
+func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx, signDesc *input.SignDescriptor) ([]byte, error) {
 	amt := signDesc.Output.Value
 	witnessScript := signDesc.WitnessScript
 	privKey := m.key
@@ -758,10 +781,10 @@ func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx, signDesc *lnwallet.SignDescri
 
 	switch {
 	case signDesc.SingleTweak != nil:
-		privKey = lnwallet.TweakPrivKey(privKey,
+		privKey = input.TweakPrivKey(privKey,
 			signDesc.SingleTweak)
 	case signDesc.DoubleTweak != nil:
-		privKey = lnwallet.DeriveRevocationPrivKey(privKey,
+		privKey = input.DeriveRevocationPrivKey(privKey,
 			signDesc.DoubleTweak)
 	}
 
@@ -774,7 +797,7 @@ func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx, signDesc *lnwallet.SignDescri
 
 	return sig[:len(sig)-1], nil
 }
-func (m *mockSigner) ComputeInputScript(tx *wire.MsgTx, signDesc *lnwallet.SignDescriptor) (*lnwallet.InputScript, error) {
+func (m *mockSigner) ComputeInputScript(tx *wire.MsgTx, signDesc *input.SignDescriptor) (*input.Script, error) {
 
 	// TODO(roasbeef): expose tweaked signer from lnwallet so don't need to
 	// duplicate this code?
@@ -783,10 +806,10 @@ func (m *mockSigner) ComputeInputScript(tx *wire.MsgTx, signDesc *lnwallet.SignD
 
 	switch {
 	case signDesc.SingleTweak != nil:
-		privKey = lnwallet.TweakPrivKey(privKey,
+		privKey = input.TweakPrivKey(privKey,
 			signDesc.SingleTweak)
 	case signDesc.DoubleTweak != nil:
-		privKey = lnwallet.DeriveRevocationPrivKey(privKey,
+		privKey = input.DeriveRevocationPrivKey(privKey,
 			signDesc.DoubleTweak)
 	}
 
@@ -797,7 +820,7 @@ func (m *mockSigner) ComputeInputScript(tx *wire.MsgTx, signDesc *lnwallet.SignD
 		return nil, err
 	}
 
-	return &lnwallet.InputScript{
+	return &input.Script{
 		Witness: witnessScript,
 	}, nil
 }

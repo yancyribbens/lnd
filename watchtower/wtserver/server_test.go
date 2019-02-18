@@ -10,17 +10,25 @@ import (
 
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcutil"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/watchtower/blob"
 	"github.com/lightningnetwork/lnd/watchtower/wtdb"
+	"github.com/lightningnetwork/lnd/watchtower/wtmock"
 	"github.com/lightningnetwork/lnd/watchtower/wtserver"
 	"github.com/lightningnetwork/lnd/watchtower/wtwire"
 )
 
-// addr is the server's reward address given to watchtower clients.
-var addr, _ = btcutil.DecodeAddress(
-	"mrX9vMRYLfVy1BnZbc5gZjuyaqH3ZW2ZHz", &chaincfg.TestNet3Params,
+var (
+	// addr is the server's reward address given to watchtower clients.
+	addr, _ = btcutil.DecodeAddress(
+		"mrX9vMRYLfVy1BnZbc5gZjuyaqH3ZW2ZHz", &chaincfg.TestNet3Params,
+	)
+
+	addrScript, _ = txscript.PayToAddrScript(addr)
+
+	testnetChainHash = *chaincfg.TestNet3Params.GenesisHash
 )
 
 // randPubKey generates a new secp keypair, and returns the public key.
@@ -53,6 +61,7 @@ func initServer(t *testing.T, db wtserver.DB,
 		NewAddress: func() (btcutil.Address, error) {
 			return addr, nil
 		},
+		ChainHash: testnetChainHash,
 	})
 	if err != nil {
 		t.Fatalf("unable to create server: %v", err)
@@ -80,12 +89,12 @@ func TestServerOnlyAcceptOnePeer(t *testing.T) {
 
 	// Create two peers using the same session id.
 	peerPub := randPubKey(t)
-	peer1 := wtserver.NewMockPeer(peerPub, nil, 0)
-	peer2 := wtserver.NewMockPeer(peerPub, nil, 0)
+	peer1 := wtmock.NewMockPeer(peerPub, nil, 0)
+	peer2 := wtmock.NewMockPeer(peerPub, nil, 0)
 
 	// Serialize a Init message to be sent by both peers.
 	init := wtwire.NewInitMessage(
-		lnwire.NewRawFeatureVector(), lnwire.NewRawFeatureVector(),
+		lnwire.NewRawFeatureVector(), testnetChainHash,
 	)
 
 	var b bytes.Buffer
@@ -107,8 +116,8 @@ func TestServerOnlyAcceptOnePeer(t *testing.T) {
 	// Try to send a message on either peer, and record the opposite peer as
 	// the one we assume to be rejected.
 	var (
-		rejectedPeer *wtserver.MockPeer
-		acceptedPeer *wtserver.MockPeer
+		rejectedPeer *wtmock.MockPeer
+		acceptedPeer *wtmock.MockPeer
 	)
 	select {
 	case peer1.IncomingMsgs <- msg:
@@ -153,32 +162,34 @@ var createSessionTests = []createSessionTestCase{
 		name: "reject duplicate session create",
 		initMsg: wtwire.NewInitMessage(
 			lnwire.NewRawFeatureVector(),
-			lnwire.NewRawFeatureVector(),
+			testnetChainHash,
 		),
 		createMsg: &wtwire.CreateSession{
 			BlobType:     blob.TypeDefault,
 			MaxUpdates:   1000,
+			RewardBase:   0,
 			RewardRate:   0,
 			SweepFeeRate: 1,
 		},
 		expReply: &wtwire.CreateSessionReply{
 			Code: wtwire.CodeOK,
-			Data: []byte(addr.ScriptAddress()),
+			Data: addrScript,
 		},
 		expDupReply: &wtwire.CreateSessionReply{
 			Code: wtwire.CreateSessionCodeAlreadyExists,
-			Data: []byte(addr.ScriptAddress()),
+			Data: addrScript,
 		},
 	},
 	{
 		name: "reject unsupported blob type",
 		initMsg: wtwire.NewInitMessage(
 			lnwire.NewRawFeatureVector(),
-			lnwire.NewRawFeatureVector(),
+			testnetChainHash,
 		),
 		createMsg: &wtwire.CreateSession{
 			BlobType:     0,
 			MaxUpdates:   1000,
+			RewardBase:   0,
 			RewardRate:   0,
 			SweepFeeRate: 1,
 		},
@@ -210,7 +221,7 @@ func testServerCreateSession(t *testing.T, i int, test createSessionTestCase) {
 
 	// Create a new client and connect to server.
 	peerPub := randPubKey(t)
-	peer := wtserver.NewMockPeer(peerPub, nil, 0)
+	peer := wtmock.NewMockPeer(peerPub, nil, 0)
 	connect(t, i, s, peer, test.initMsg, timeoutDuration)
 
 	// Send the CreateSession message, and wait for a reply.
@@ -238,7 +249,7 @@ func testServerCreateSession(t *testing.T, i int, test createSessionTestCase) {
 
 	// Simulate a peer with the same session id connection to the server
 	// again.
-	peer = wtserver.NewMockPeer(peerPub, nil, 0)
+	peer = wtmock.NewMockPeer(peerPub, nil, 0)
 	connect(t, i, s, peer, test.initMsg, timeoutDuration)
 
 	// Send the _same_ CreateSession message as the first attempt.
@@ -271,13 +282,14 @@ var stateUpdateTests = []stateUpdateTestCase{
 	// Valid update sequence, send seqnum == lastapplied as last update.
 	{
 		name: "perm fail after sending seqnum equal lastapplied",
-		initMsg: &wtwire.Init{&lnwire.Init{
-			LocalFeatures:  lnwire.NewRawFeatureVector(),
-			GlobalFeatures: lnwire.NewRawFeatureVector(),
-		}},
+		initMsg: wtwire.NewInitMessage(
+			lnwire.NewRawFeatureVector(),
+			testnetChainHash,
+		),
 		createMsg: &wtwire.CreateSession{
 			BlobType:     blob.TypeDefault,
 			MaxUpdates:   3,
+			RewardBase:   0,
 			RewardRate:   0,
 			SweepFeeRate: 1,
 		},
@@ -300,13 +312,14 @@ var stateUpdateTests = []stateUpdateTestCase{
 	// Send update that skips next expected sequence number.
 	{
 		name: "skip sequence number",
-		initMsg: &wtwire.Init{&lnwire.Init{
-			LocalFeatures:  lnwire.NewRawFeatureVector(),
-			GlobalFeatures: lnwire.NewRawFeatureVector(),
-		}},
+		initMsg: wtwire.NewInitMessage(
+			lnwire.NewRawFeatureVector(),
+			testnetChainHash,
+		),
 		createMsg: &wtwire.CreateSession{
 			BlobType:     blob.TypeDefault,
 			MaxUpdates:   4,
+			RewardBase:   0,
 			RewardRate:   0,
 			SweepFeeRate: 1,
 		},
@@ -323,13 +336,14 @@ var stateUpdateTests = []stateUpdateTestCase{
 	// Send update that reverts to older sequence number.
 	{
 		name: "revert to older seqnum",
-		initMsg: &wtwire.Init{&lnwire.Init{
-			LocalFeatures:  lnwire.NewRawFeatureVector(),
-			GlobalFeatures: lnwire.NewRawFeatureVector(),
-		}},
+		initMsg: wtwire.NewInitMessage(
+			lnwire.NewRawFeatureVector(),
+			testnetChainHash,
+		),
 		createMsg: &wtwire.CreateSession{
 			BlobType:     blob.TypeDefault,
 			MaxUpdates:   4,
+			RewardBase:   0,
 			RewardRate:   0,
 			SweepFeeRate: 1,
 		},
@@ -350,13 +364,14 @@ var stateUpdateTests = []stateUpdateTestCase{
 	// Send update echoing a last applied that is lower than previous value.
 	{
 		name: "revert to older lastapplied",
-		initMsg: &wtwire.Init{&lnwire.Init{
-			LocalFeatures:  lnwire.NewRawFeatureVector(),
-			GlobalFeatures: lnwire.NewRawFeatureVector(),
-		}},
+		initMsg: wtwire.NewInitMessage(
+			lnwire.NewRawFeatureVector(),
+			testnetChainHash,
+		),
 		createMsg: &wtwire.CreateSession{
 			BlobType:     blob.TypeDefault,
 			MaxUpdates:   4,
+			RewardBase:   0,
 			RewardRate:   0,
 			SweepFeeRate: 1,
 		},
@@ -377,13 +392,14 @@ var stateUpdateTests = []stateUpdateTestCase{
 	// Client echos last applied as they are received.
 	{
 		name: "resume after disconnect",
-		initMsg: &wtwire.Init{&lnwire.Init{
-			LocalFeatures:  lnwire.NewRawFeatureVector(),
-			GlobalFeatures: lnwire.NewRawFeatureVector(),
-		}},
+		initMsg: wtwire.NewInitMessage(
+			lnwire.NewRawFeatureVector(),
+			testnetChainHash,
+		),
 		createMsg: &wtwire.CreateSession{
 			BlobType:     blob.TypeDefault,
 			MaxUpdates:   4,
+			RewardBase:   0,
 			RewardRate:   0,
 			SweepFeeRate: 1,
 		},
@@ -406,13 +422,14 @@ var stateUpdateTests = []stateUpdateTestCase{
 	// Client doesn't echo last applied until last message.
 	{
 		name: "resume after disconnect lagging lastapplied",
-		initMsg: &wtwire.Init{&lnwire.Init{
-			LocalFeatures:  lnwire.NewRawFeatureVector(),
-			GlobalFeatures: lnwire.NewRawFeatureVector(),
-		}},
+		initMsg: wtwire.NewInitMessage(
+			lnwire.NewRawFeatureVector(),
+			testnetChainHash,
+		),
 		createMsg: &wtwire.CreateSession{
 			BlobType:     blob.TypeDefault,
 			MaxUpdates:   4,
+			RewardBase:   0,
 			RewardRate:   0,
 			SweepFeeRate: 1,
 		},
@@ -434,13 +451,14 @@ var stateUpdateTests = []stateUpdateTestCase{
 	// Send update with sequence number that exceeds MaxUpdates.
 	{
 		name: "seqnum exceed maxupdates",
-		initMsg: &wtwire.Init{&lnwire.Init{
-			LocalFeatures:  lnwire.NewRawFeatureVector(),
-			GlobalFeatures: lnwire.NewRawFeatureVector(),
-		}},
+		initMsg: wtwire.NewInitMessage(
+			lnwire.NewRawFeatureVector(),
+			testnetChainHash,
+		),
 		createMsg: &wtwire.CreateSession{
 			BlobType:     blob.TypeDefault,
 			MaxUpdates:   3,
+			RewardBase:   0,
 			RewardRate:   0,
 			SweepFeeRate: 1,
 		},
@@ -463,13 +481,14 @@ var stateUpdateTests = []stateUpdateTestCase{
 	// Ensure sequence number 0 causes permanent failure.
 	{
 		name: "perm fail after seqnum 0",
-		initMsg: &wtwire.Init{&lnwire.Init{
-			LocalFeatures:  lnwire.NewRawFeatureVector(),
-			GlobalFeatures: lnwire.NewRawFeatureVector(),
-		}},
+		initMsg: wtwire.NewInitMessage(
+			lnwire.NewRawFeatureVector(),
+			testnetChainHash,
+		),
 		createMsg: &wtwire.CreateSession{
 			BlobType:     blob.TypeDefault,
 			MaxUpdates:   3,
+			RewardBase:   0,
 			RewardRate:   0,
 			SweepFeeRate: 1,
 		},
@@ -510,7 +529,7 @@ func testServerStateUpdates(t *testing.T, i int, test stateUpdateTestCase) {
 
 	// Create a new client and connect to the server.
 	peerPub := randPubKey(t)
-	peer := wtserver.NewMockPeer(peerPub, nil, 0)
+	peer := wtmock.NewMockPeer(peerPub, nil, 0)
 	connect(t, i, s, peer, test.initMsg, timeoutDuration)
 
 	// Register a session for this client to use in the subsequent tests.
@@ -530,7 +549,7 @@ func testServerStateUpdates(t *testing.T, i int, test stateUpdateTestCase) {
 
 	// Now that the original connection has been closed, connect a new
 	// client with the same session id.
-	peer = wtserver.NewMockPeer(peerPub, nil, 0)
+	peer = wtmock.NewMockPeer(peerPub, nil, 0)
 	connect(t, i, s, peer, test.initMsg, timeoutDuration)
 
 	// Send the intended StateUpdate messages in series.
@@ -541,7 +560,7 @@ func testServerStateUpdates(t *testing.T, i int, test stateUpdateTestCase) {
 		if update == nil {
 			assertConnClosed(t, peer, 2*timeoutDuration)
 
-			peer = wtserver.NewMockPeer(peerPub, nil, 0)
+			peer = wtmock.NewMockPeer(peerPub, nil, 0)
 			connect(t, i, s, peer, test.initMsg, timeoutDuration)
 
 			continue
@@ -565,7 +584,7 @@ func testServerStateUpdates(t *testing.T, i int, test stateUpdateTestCase) {
 	assertConnClosed(t, peer, 2*timeoutDuration)
 }
 
-func connect(t *testing.T, i int, s wtserver.Interface, peer *wtserver.MockPeer,
+func connect(t *testing.T, i int, s wtserver.Interface, peer *wtmock.MockPeer,
 	initMsg *wtwire.Init, timeout time.Duration) {
 
 	s.InboundPeerConnected(peer)
@@ -573,9 +592,9 @@ func connect(t *testing.T, i int, s wtserver.Interface, peer *wtserver.MockPeer,
 	recvReply(t, i, "Init", peer, timeout)
 }
 
-// sendMsg sends a wtwire.Message message via a wtserver.MockPeer.
+// sendMsg sends a wtwire.Message message via a wtmock.MockPeer.
 func sendMsg(t *testing.T, i int, msg wtwire.Message,
-	peer *wtserver.MockPeer, timeout time.Duration) {
+	peer *wtmock.MockPeer, timeout time.Duration) {
 
 	t.Helper()
 
@@ -597,7 +616,7 @@ func sendMsg(t *testing.T, i int, msg wtwire.Message,
 // expected reply type. The supported replies are CreateSessionReply and
 // StateUpdateReply.
 func recvReply(t *testing.T, i int, name string,
-	peer *wtserver.MockPeer, timeout time.Duration) wtwire.Message {
+	peer *wtmock.MockPeer, timeout time.Duration) wtwire.Message {
 
 	t.Helper()
 
@@ -641,7 +660,7 @@ func recvReply(t *testing.T, i int, name string,
 
 // assertConnClosed checks that the peer's connection is closed before the
 // timeout expires.
-func assertConnClosed(t *testing.T, peer *wtserver.MockPeer, duration time.Duration) {
+func assertConnClosed(t *testing.T, peer *wtmock.MockPeer, duration time.Duration) {
 	t.Helper()
 
 	select {

@@ -9,13 +9,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/htlcswitch/hodl"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnpeer"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/ticker"
@@ -348,7 +350,7 @@ func NewChannelLink(cfg ChannelLinkConfig,
 		shortChanID: channel.ShortChanID(),
 		// TODO(roasbeef): just do reserve here?
 		logCommitTimer: time.NewTimer(300 * time.Millisecond),
-		overflowQueue:  newPacketQueue(lnwallet.MaxHTLCNumber / 2),
+		overflowQueue:  newPacketQueue(input.MaxHTLCNumber / 2),
 		htlcUpdates:    make(chan []channeldb.HTLC),
 		quit:           make(chan struct{}),
 	}
@@ -1742,6 +1744,12 @@ func (l *channelLink) Peer() lnpeer.Peer {
 	return l.cfg.Peer
 }
 
+// ChannelPoint returns the channel outpoint for the channel link.
+// NOTE: Part of the ChannelLink interface.
+func (l *channelLink) ChannelPoint() *wire.OutPoint {
+	return l.channel.ChannelPoint()
+}
+
 // ShortChanID returns the short channel ID for the channel link. The short
 // channel ID encodes the exact location in the main chain that the original
 // funding output can be found.
@@ -2311,16 +2319,35 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 			// We're the designated payment destination.  Therefore
 			// we attempt to see if we have an invoice locally
 			// which'll allow us to settle this htlc.
-			invoiceHash := chainhash.Hash(pd.RHash)
+			invoiceHash := lntypes.Hash(pd.RHash)
 			invoice, minCltvDelta, err := l.cfg.Registry.LookupInvoice(
 				invoiceHash,
 			)
 			if err != nil {
 				log.Errorf("unable to query invoice registry: "+
 					" %v", err)
-				failure := lnwire.FailUnknownPaymentHash{}
+				failure := lnwire.NewFailUnknownPaymentHash(
+					pd.Amount,
+				)
 				l.sendHTLCError(
 					pd.HtlcIndex, failure, obfuscator, pd.SourceRef,
+				)
+
+				needUpdate = true
+				continue
+			}
+
+			// Reject htlcs for canceled invoices.
+			if invoice.Terms.State == channeldb.ContractCanceled {
+				l.errorf("Rejecting htlc due to canceled " +
+					"invoice")
+
+				failure := lnwire.NewFailUnknownPaymentHash(
+					pd.Amount,
+				)
+				l.sendHTLCError(
+					pd.HtlcIndex, failure, obfuscator,
+					pd.SourceRef,
 				)
 
 				needUpdate = true
@@ -2367,7 +2394,9 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 					"amount: expected %v, received %v",
 					invoice.Terms.Value, pd.Amount)
 
-				failure := lnwire.FailIncorrectPaymentAmount{}
+				failure := lnwire.NewFailUnknownPaymentHash(
+					pd.Amount,
+				)
 				l.sendHTLCError(
 					pd.HtlcIndex, failure, obfuscator, pd.SourceRef,
 				)
@@ -2394,7 +2423,9 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 					"got %v", pd.RHash, invoice.Terms.Value,
 					fwdInfo.AmountToForward)
 
-				failure := lnwire.FailIncorrectPaymentAmount{}
+				failure := lnwire.NewFailUnknownPaymentHash(
+					pd.Amount,
+				)
 				l.sendHTLCError(
 					pd.HtlcIndex, failure, obfuscator, pd.SourceRef,
 				)

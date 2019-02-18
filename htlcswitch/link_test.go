@@ -26,6 +26,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/htlcswitch/hodl"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnpeer"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -217,7 +218,7 @@ func TestChannelLinkSingleHopPayment(t *testing.T) {
 	// * user notification to be sent.
 	receiver := n.bobServer
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	rhash, err := n.makePayment(
+	rhash, err := makePayment(
 		n.aliceServer, receiver, firstHop, hops, amount, htlcAmt,
 		totalTimelock,
 	).Wait(30 * time.Second)
@@ -302,7 +303,7 @@ func TestChannelLinkBidirectionalOneHopPayments(t *testing.T) {
 
 	// Send max available payment number in both sides, thereby testing
 	// the property of channel link to cope with overflowing.
-	count := 2 * lnwallet.MaxHTLCNumber
+	count := 2 * input.MaxHTLCNumber
 	resultChan := make(chan *result, count)
 	for i := 0; i < count/2; i++ {
 		go func(i int) {
@@ -313,7 +314,7 @@ func TestChannelLinkBidirectionalOneHopPayments(t *testing.T) {
 			}
 
 			firstHop := n.firstBobChannelLink.ShortChanID()
-			_, r.err = n.makePayment(
+			_, r.err = makePayment(
 				n.aliceServer, n.bobServer, firstHop,
 				hopsForwards, amt, htlcAmt, totalTimelock,
 			).Wait(5 * time.Minute)
@@ -330,7 +331,7 @@ func TestChannelLinkBidirectionalOneHopPayments(t *testing.T) {
 			}
 
 			firstHop := n.aliceChannelLink.ShortChanID()
-			_, r.err = n.makePayment(
+			_, r.err = makePayment(
 				n.bobServer, n.aliceServer, firstHop,
 				hopsBackwards, amt, htlcAmt, totalTimelock,
 			).Wait(5 * time.Minute)
@@ -450,7 +451,7 @@ func TestChannelLinkMultiHopPayment(t *testing.T) {
 	// * user notification to be sent.
 	receiver := n.carolServer
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	rhash, err := n.makePayment(
+	rhash, err := makePayment(
 		n.aliceServer, n.carolServer, firstHop, hops, amount, htlcAmt,
 		totalTimelock,
 	).Wait(30 * time.Second)
@@ -528,7 +529,7 @@ func TestExitNodeTimelockPayloadMismatch(t *testing.T) {
 	// the receiving node, instead we set it to be a random value.
 	hops[0].OutgoingCTLV = 500
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	_, err = n.makePayment(
+	_, err = makePayment(
 		n.aliceServer, n.bobServer, firstHop, hops, amount, htlcAmt,
 		htlcExpiry,
 	).Wait(30 * time.Second)
@@ -581,17 +582,17 @@ func TestExitNodeAmountPayloadMismatch(t *testing.T) {
 	// receiving node expects to receive.
 	hops[0].AmountToForward = 1
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	_, err = n.makePayment(
+	_, err = makePayment(
 		n.aliceServer, n.bobServer, firstHop, hops, amount, htlcAmt,
 		htlcExpiry,
 	).Wait(30 * time.Second)
 	if err == nil {
 		t.Fatalf("payment should have failed but didn't")
-	} else if err.Error() != lnwire.CodeIncorrectPaymentAmount.String() {
+	} else if !strings.Contains(err.Error(), lnwire.CodeUnknownPaymentHash.String()) {
 		// TODO(roasbeef): use proper error after error propagation is
 		// in
-		t.Fatalf("incorrect error, expected insufficient value, "+
-			"instead have: %v", err)
+		t.Fatalf("expected %v got %v", err,
+			lnwire.CodeUnknownPaymentHash)
 	}
 }
 
@@ -629,7 +630,7 @@ func TestLinkForwardTimelockPolicyMismatch(t *testing.T) {
 	// Next, we'll make the payment which'll send an HTLC with our
 	// specified parameters to the first hop in the route.
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	_, err = n.makePayment(
+	_, err = makePayment(
 		n.aliceServer, n.carolServer, firstHop, hops, amount, htlcAmt,
 		htlcExpiry,
 	).Wait(30 * time.Second)
@@ -687,7 +688,7 @@ func TestLinkForwardFeePolicyMismatch(t *testing.T) {
 	// Next, we'll make the payment which'll send an HTLC with our
 	// specified parameters to the first hop in the route.
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	_, err = n.makePayment(
+	_, err = makePayment(
 		n.aliceServer, n.bobServer, firstHop, hops, amountNoFee,
 		amountNoFee, htlcExpiry,
 	).Wait(30 * time.Second)
@@ -745,7 +746,7 @@ func TestLinkForwardMinHTLCPolicyMismatch(t *testing.T) {
 	// Next, we'll make the payment which'll send an HTLC with our
 	// specified parameters to the first hop in the route.
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	_, err = n.makePayment(
+	_, err = makePayment(
 		n.aliceServer, n.bobServer, firstHop, hops, amountNoFee,
 		htlcAmt, htlcExpiry,
 	).Wait(30 * time.Second)
@@ -804,7 +805,7 @@ func TestUpdateForwardingPolicy(t *testing.T) {
 	// First, send this 10 mSAT payment over the three hops, the payment
 	// should succeed, and all balances should be updated accordingly.
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	payResp, err := n.makePayment(
+	payResp, err := makePayment(
 		n.aliceServer, n.carolServer, firstHop, hops, amountNoFee,
 		htlcAmt, htlcExpiry,
 	).Wait(30 * time.Second)
@@ -855,7 +856,7 @@ func TestUpdateForwardingPolicy(t *testing.T) {
 	// Next, we'll send the payment again, using the exact same per-hop
 	// payload for each node. This payment should fail as it won't factor
 	// in Bob's new fee policy.
-	_, err = n.makePayment(
+	_, err = makePayment(
 		n.aliceServer, n.carolServer, firstHop, hops, amountNoFee,
 		htlcAmt, htlcExpiry,
 	).Wait(30 * time.Second)
@@ -916,7 +917,7 @@ func TestChannelLinkMultiHopInsufficientPayment(t *testing.T) {
 
 	receiver := n.carolServer
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	rhash, err := n.makePayment(
+	rhash, err := makePayment(
 		n.aliceServer, n.carolServer, firstHop, hops, amount, htlcAmt,
 		totalTimelock,
 	).Wait(30 * time.Second)
@@ -1017,8 +1018,9 @@ func TestChannelLinkMultiHopUnknownPaymentHash(t *testing.T) {
 		n.firstBobChannelLink.ShortChanID(), htlc,
 		newMockDeobfuscator(),
 	)
-	if err.Error() != lnwire.CodeUnknownPaymentHash.String() {
-		t.Fatal("error haven't been received")
+	if !strings.Contains(err.Error(), lnwire.CodeUnknownPaymentHash.String()) {
+		t.Fatalf("expected %v got %v", err,
+			lnwire.CodeUnknownPaymentHash)
 	}
 
 	// Wait for Alice to receive the revocation.
@@ -1092,7 +1094,7 @@ func TestChannelLinkMultiHopUnknownNextHop(t *testing.T) {
 
 	firstHop := n.firstBobChannelLink.ShortChanID()
 	receiver := n.carolServer
-	rhash, err := n.makePayment(
+	rhash, err := makePayment(
 		n.aliceServer, receiver, firstHop, hops, amount, htlcAmt,
 		totalTimelock).Wait(30 * time.Second)
 	if err == nil {
@@ -1199,7 +1201,7 @@ func TestChannelLinkMultiHopDecodeError(t *testing.T) {
 
 	receiver := n.carolServer
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	rhash, err := n.makePayment(
+	rhash, err := makePayment(
 		n.aliceServer, n.carolServer, firstHop, hops, amount, htlcAmt,
 		totalTimelock,
 	).Wait(30 * time.Second)
@@ -1285,7 +1287,7 @@ func TestChannelLinkExpiryTooSoonExitNode(t *testing.T) {
 
 	// Now we'll send out the payment from Alice to Bob.
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	_, err = n.makePayment(
+	_, err = makePayment(
 		n.aliceServer, n.bobServer, firstHop, hops, amount, htlcAmt,
 		totalTimelock,
 	).Wait(30 * time.Second)
@@ -1345,7 +1347,7 @@ func TestChannelLinkExpiryTooSoonMidNode(t *testing.T) {
 
 	// Now we'll send out the payment from Alice to Bob.
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	_, err = n.makePayment(
+	_, err = makePayment(
 		n.aliceServer, n.bobServer, firstHop, hops, amount, htlcAmt,
 		totalTimelock,
 	).Wait(30 * time.Second)
@@ -1444,7 +1446,7 @@ func TestChannelLinkSingleHopMessageOrdering(t *testing.T) {
 	// * alice<->bob commitment state to be updated.
 	// * user notification to be sent.
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	_, err = n.makePayment(
+	_, err = makePayment(
 		n.aliceServer, n.bobServer, firstHop, hops, amount, htlcAmt,
 		totalTimelock,
 	).Wait(30 * time.Second)
@@ -1543,7 +1545,7 @@ func newSingleLinkTestHarness(chanAmt, chanReserve btcutil.Amount) (
 
 	// Instantiate with a long interval, so that we can precisely control
 	// the firing via force feeding.
-	bticker := ticker.MockNew(time.Hour)
+	bticker := ticker.NewForce(time.Hour)
 	aliceCfg := ChannelLinkConfig{
 		FwrdingPolicy:      globalPolicy,
 		Peer:               alicePeer,
@@ -1566,7 +1568,7 @@ func newSingleLinkTestHarness(chanAmt, chanReserve btcutil.Amount) (
 		Registry:       invoiceRegistry,
 		ChainEvents:    &contractcourt.ChainEventSubscription{},
 		BatchTicker:    bticker,
-		FwdPkgGCTicker: ticker.MockNew(15 * time.Second),
+		FwdPkgGCTicker: ticker.NewForce(15 * time.Second),
 		// Make the BatchSize and Min/MaxFeeUpdateTimeout large enough
 		// to not trigger commit updates automatically during tests.
 		BatchSize:           10000,
@@ -1801,7 +1803,7 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 		t.Fatalf("unable to query fee estimator: %v", err)
 	}
 	htlcFee := lnwire.NewMSatFromSatoshis(
-		feePerKw.FeeForWeight(lnwallet.HtlcWeight),
+		feePerKw.FeeForWeight(input.HtlcWeight),
 	)
 
 	// The starting bandwidth of the channel should be exactly the amount
@@ -2241,7 +2243,7 @@ func TestChannelLinkBandwidthConsistencyOverflow(t *testing.T) {
 	// consistency along the way
 	htlcAmt := lnwire.NewMSatFromSatoshis(100000)
 	totalHtlcAmt := lnwire.MilliSatoshi(0)
-	const numHTLCs = lnwallet.MaxHTLCNumber / 2
+	const numHTLCs = input.MaxHTLCNumber / 2
 	var preImages [][32]byte
 	for i := 0; i < numHTLCs; i++ {
 		preImage := addLinkHTLC(htlcID, htlcAmt)
@@ -2279,7 +2281,7 @@ func TestChannelLinkBandwidthConsistencyOverflow(t *testing.T) {
 
 	// TODO(roasbeef): increase sleep
 	time.Sleep(time.Second * 1)
-	commitWeight := lnwallet.CommitWeight + lnwallet.HtlcWeight*numHTLCs
+	commitWeight := input.CommitWeight + input.HtlcWeight*numHTLCs
 	htlcFee := lnwire.NewMSatFromSatoshis(
 		feePerKw.FeeForWeight(commitWeight),
 	)
@@ -2461,7 +2463,7 @@ func TestChannelLinkTrimCircuitsPending(t *testing.T) {
 
 	defaultCommitFee := alice.channel.StateSnapshot().CommitFee
 	htlcFee := lnwire.NewMSatFromSatoshis(
-		feePerKw.FeeForWeight(lnwallet.HtlcWeight),
+		feePerKw.FeeForWeight(input.HtlcWeight),
 	)
 
 	// The starting bandwidth of the channel should be exactly the amount
@@ -2739,7 +2741,7 @@ func TestChannelLinkTrimCircuitsNoCommit(t *testing.T) {
 
 	defaultCommitFee := alice.channel.StateSnapshot().CommitFee
 	htlcFee := lnwire.NewMSatFromSatoshis(
-		feePerKw.FeeForWeight(lnwallet.HtlcWeight),
+		feePerKw.FeeForWeight(input.HtlcWeight),
 	)
 
 	// The starting bandwidth of the channel should be exactly the amount
@@ -2995,7 +2997,7 @@ func TestChannelLinkBandwidthChanReserve(t *testing.T) {
 		t.Fatalf("unable to query fee estimator: %v", err)
 	}
 	htlcFee := lnwire.NewMSatFromSatoshis(
-		feePerKw.FeeForWeight(lnwallet.HtlcWeight),
+		feePerKw.FeeForWeight(input.HtlcWeight),
 	)
 
 	// The starting bandwidth of the channel should be exactly the amount
@@ -3281,7 +3283,7 @@ func TestChannelRetransmission(t *testing.T) {
 		// TODO(roasbeef); increase timeout?
 		receiver := n.bobServer
 		firstHop := n.firstBobChannelLink.ShortChanID()
-		rhash, err := n.makePayment(
+		rhash, err := makePayment(
 			n.aliceServer, receiver, firstHop, hops, amount,
 			htlcAmt, totalTimelock,
 		).Wait(time.Second * 5)
@@ -3504,7 +3506,7 @@ func TestChannelLinkShutdownDuringForward(t *testing.T) {
 	// unblocks after nothing has been pulled for two seconds.
 	waitForBobsSwitchToBlock := func() {
 		bobSwitch := n.firstBobChannelLink.cfg.Switch
-		ticker := bobSwitch.cfg.LogEventTicker.(*ticker.Mock)
+		ticker := bobSwitch.cfg.LogEventTicker.(*ticker.Force)
 		timeout := time.After(15 * time.Second)
 		for {
 			time.Sleep(50 * time.Millisecond)
@@ -3523,7 +3525,7 @@ func TestChannelLinkShutdownDuringForward(t *testing.T) {
 	// Define a helper method that strobes the link's batch ticker, and
 	// unblocks after nothing has been pulled for two seconds.
 	waitForBobsIncomingLinkToBlock := func() {
-		ticker := n.firstBobChannelLink.cfg.BatchTicker.(*ticker.Mock)
+		ticker := n.firstBobChannelLink.cfg.BatchTicker.(*ticker.Force)
 		timeout := time.After(15 * time.Second)
 		for {
 			time.Sleep(50 * time.Millisecond)
@@ -3576,7 +3578,7 @@ func TestChannelLinkShutdownDuringForward(t *testing.T) {
 	)
 
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	n.makePayment(
+	makePayment(
 		n.aliceServer, n.carolServer, firstHop, hops, amount, htlcAmt,
 		totalTimelock,
 	)
@@ -3812,7 +3814,7 @@ func TestChannelLinkAcceptOverpay(t *testing.T) {
 	// invoice at Carol for only half of this amount.
 	receiver := n.carolServer
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	rhash, err := n.makePayment(
+	rhash, err := makePayment(
 		n.aliceServer, n.carolServer, firstHop, hops, amount/2, htlcAmt,
 		totalTimelock,
 	).Wait(30 * time.Second)
@@ -4058,7 +4060,7 @@ func restartLink(aliceChannel *lnwallet.LightningChannel, aliceSwitch *Switch,
 
 	// Instantiate with a long interval, so that we can precisely control
 	// the firing via force feeding.
-	bticker := ticker.MockNew(time.Hour)
+	bticker := ticker.NewForce(time.Hour)
 	aliceCfg := ChannelLinkConfig{
 		FwrdingPolicy:      globalPolicy,
 		Peer:               alicePeer,
@@ -5117,7 +5119,7 @@ func TestForwardingAsymmetricTimeLockPolicies(t *testing.T) {
 	)
 
 	firstHop := n.firstBobChannelLink.ShortChanID()
-	_, err = n.makePayment(
+	_, err = makePayment(
 		n.aliceServer, n.carolServer, firstHop, hops, amount, htlcAmt,
 		totalTimelock,
 	).Wait(30 * time.Second)
@@ -5198,4 +5200,61 @@ func TestHtlcSatisfyPolicy(t *testing.T) {
 			t.Fatalf("expected FailExpiryTooFar failure code")
 		}
 	})
+}
+
+// TestChannelLinkCanceledInvoice in this test checks the interaction
+// between Alice and Bob for a canceled invoice.
+func TestChannelLinkCanceledInvoice(t *testing.T) {
+	t.Parallel()
+
+	// Setup a alice-bob network.
+	aliceChannel, bobChannel, cleanUp, err := createTwoClusterChannels(
+		btcutil.SatoshiPerBitcoin*3,
+		btcutil.SatoshiPerBitcoin*5)
+	if err != nil {
+		t.Fatalf("unable to create channel: %v", err)
+	}
+	defer cleanUp()
+
+	n := newTwoHopNetwork(t, aliceChannel, bobChannel, testStartingHeight)
+	if err := n.start(); err != nil {
+		t.Fatal(err)
+	}
+	defer n.stop()
+
+	// Prepare an alice -> bob payment.
+	amount := lnwire.NewMSatFromSatoshis(btcutil.SatoshiPerBitcoin)
+	htlcAmt, totalTimelock, hops := generateHops(amount, testStartingHeight,
+		n.bobChannelLink)
+
+	firstHop := n.bobChannelLink.ShortChanID()
+
+	invoice, payFunc, err := preparePayment(
+		n.aliceServer, n.bobServer, firstHop, hops, amount, htlcAmt,
+		totalTimelock,
+	)
+	if err != nil {
+		t.Fatalf("unable to prepare the payment: %v", err)
+	}
+
+	// Cancel the invoice at bob's end.
+	hash := invoice.Terms.PaymentPreimage.Hash()
+	err = n.bobServer.registry.CancelInvoice(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Have Alice fire the payment.
+	err = waitForPayFuncResult(payFunc, 30*time.Second)
+
+	// Because the invoice is canceled, we expect an unknown payment hash
+	// result.
+	fErr, ok := err.(*ForwardingError)
+	if !ok {
+		t.Fatalf("expected ForwardingError, but got %v", err)
+	}
+	_, ok = fErr.FailureMessage.(*lnwire.FailUnknownPaymentHash)
+	if !ok {
+		t.Fatalf("expected unknown payment hash, but got %v", err)
+	}
 }

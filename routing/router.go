@@ -16,9 +16,11 @@ import (
 	"github.com/coreos/bbolt"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/go-errors/errors"
-	"github.com/lightningnetwork/lightning-onion"
+
+	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/htlcswitch"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/multimutex"
@@ -84,7 +86,7 @@ type ChannelGraphSource interface {
 	// edge for the passed channel ID (and flags) that have a more recent
 	// timestamp.
 	IsStaleEdgePolicy(chanID lnwire.ShortChannelID, timestamp time.Time,
-		flags lnwire.ChanUpdateFlag) bool
+		flags lnwire.ChanUpdateChanFlags) bool
 
 	// ForAllOutgoingChannels is used to iterate over all channels
 	// emanating from the "source" node which is the center of the
@@ -243,7 +245,7 @@ func newEdgeLocatorByPubkeys(channelID uint64, fromNode, toNode *Vertex) *edgeLo
 func newEdgeLocator(edge *channeldb.ChannelEdgePolicy) *edgeLocator {
 	return &edgeLocator{
 		channelID: edge.ChannelID,
-		direction: uint8(edge.Flags & lnwire.ChanUpdateDirection),
+		direction: uint8(edge.ChannelFlags & lnwire.ChanUpdateDirection),
 	}
 }
 
@@ -1034,13 +1036,13 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 		// Recreate witness output to be sure that declared in channel
 		// edge bitcoin keys and channel value corresponds to the
 		// reality.
-		witnessScript, err := lnwallet.GenMultiSigScript(
+		witnessScript, err := input.GenMultiSigScript(
 			msg.BitcoinKey1Bytes[:], msg.BitcoinKey2Bytes[:],
 		)
 		if err != nil {
 			return err
 		}
-		fundingPkScript, err := lnwallet.WitnessScriptHash(witnessScript)
+		fundingPkScript, err := input.WitnessScriptHash(witnessScript)
 		if err != nil {
 			return err
 		}
@@ -1123,8 +1125,6 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 		}
 		r.rejectMtx.RUnlock()
 
-		channelID := lnwire.NewShortChanIDFromInt(msg.ChannelID)
-
 		// We make sure to hold the mutex for this channel ID,
 		// such that no other goroutine is concurrently doing
 		// database accesses for the same channel ID.
@@ -1140,6 +1140,15 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 
 		}
 
+		// If the channel doesn't exist in our database, we cannot
+		// apply the updated policy.
+		if !exists {
+			return newErrf(ErrIgnored, "Ignoring update "+
+				"(flags=%v|%v) for unknown chan_id=%v",
+				msg.MessageFlags, msg.ChannelFlags,
+				msg.ChannelID)
+		}
+
 		// As edges are directional edge node has a unique policy for
 		// the direction of the edge they control. Therefore we first
 		// check if we already have the most up to date information for
@@ -1149,55 +1158,26 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 
 		// A flag set of 0 indicates this is an announcement for the
 		// "first" node in the channel.
-		case msg.Flags&lnwire.ChanUpdateDirection == 0:
+		case msg.ChannelFlags&lnwire.ChanUpdateDirection == 0:
 
 			// Ignore outdated message.
 			if !edge1Timestamp.Before(msg.LastUpdate) {
 				return newErrf(ErrOutdated, "Ignoring "+
-					"outdated update (flags=%v) for known "+
-					"chan_id=%v", msg.Flags, msg.ChannelID)
-
+					"outdated update (flags=%v|%v) for "+
+					"known chan_id=%v", msg.MessageFlags,
+					msg.ChannelFlags, msg.ChannelID)
 			}
 
 		// Similarly, a flag set of 1 indicates this is an announcement
 		// for the "second" node in the channel.
-		case msg.Flags&lnwire.ChanUpdateDirection == 1:
+		case msg.ChannelFlags&lnwire.ChanUpdateDirection == 1:
 
 			// Ignore outdated message.
 			if !edge2Timestamp.Before(msg.LastUpdate) {
 				return newErrf(ErrOutdated, "Ignoring "+
-					"outdated update (flags=%v) for known "+
-					"chan_id=%v", msg.Flags, msg.ChannelID)
-			}
-		}
-
-		if !exists && !r.cfg.AssumeChannelValid {
-			// Before we can update the channel information, we'll
-			// ensure that the target channel is still open by
-			// querying the utxo-set for its existence.
-			chanPoint, fundingTxOut, err := r.fetchChanPoint(
-				&channelID,
-			)
-			if err != nil {
-				r.rejectMtx.Lock()
-				r.rejectCache[msg.ChannelID] = struct{}{}
-				r.rejectMtx.Unlock()
-
-				return errors.Errorf("unable to fetch chan "+
-					"point for chan_id=%v: %v",
-					msg.ChannelID, err)
-			}
-			_, err = r.cfg.Chain.GetUtxo(
-				chanPoint, fundingTxOut.PkScript,
-				channelID.BlockHeight,
-			)
-			if err != nil {
-				r.rejectMtx.Lock()
-				r.rejectCache[msg.ChannelID] = struct{}{}
-				r.rejectMtx.Unlock()
-
-				return errors.Errorf("unable to fetch utxo for "+
-					"chan_id=%v: %v", msg.ChannelID, err)
+					"outdated update (flags=%v|%v) for "+
+					"known chan_id=%v", msg.MessageFlags,
+					msg.ChannelFlags, msg.ChannelID)
 			}
 		}
 
@@ -1278,45 +1258,6 @@ func (r *ChannelRouter) fetchChanPoint(
 type routingMsg struct {
 	msg interface{}
 	err chan error
-}
-
-// pruneNodeFromRoutes accepts set of routes, and returns a new set of routes
-// with the target node filtered out.
-func pruneNodeFromRoutes(routes []*Route, skipNode Vertex) []*Route {
-
-	// TODO(roasbeef): pass in slice index?
-
-	prunedRoutes := make([]*Route, 0, len(routes))
-	for _, route := range routes {
-		if route.containsNode(skipNode) {
-			continue
-		}
-
-		prunedRoutes = append(prunedRoutes, route)
-	}
-
-	log.Tracef("Filtered out %v routes with node %x",
-		len(routes)-len(prunedRoutes), skipNode[:])
-
-	return prunedRoutes
-}
-
-// pruneChannelFromRoutes accepts a set of routes, and returns a new set of
-// routes with the target channel filtered out.
-func pruneChannelFromRoutes(routes []*Route, skipChan uint64) []*Route {
-	prunedRoutes := make([]*Route, 0, len(routes))
-	for _, route := range routes {
-		if route.containsChannel(skipChan) {
-			continue
-		}
-
-		prunedRoutes = append(prunedRoutes, route)
-	}
-
-	log.Tracef("Filtered out %v routes with channel %v",
-		len(routes)-len(prunedRoutes), skipChan)
-
-	return prunedRoutes
 }
 
 // pathsToFeeSortedRoutes takes a set of paths, and returns a corresponding set
@@ -1609,6 +1550,10 @@ type LightningPayment struct {
 	// destination successfully.
 	RouteHints [][]HopHint
 
+	// OutgoingChannelID is the channel that needs to be taken to the first
+	// hop. If nil, any channel may be used.
+	OutgoingChannelID *uint64
+
 	// TODO(roasbeef): add e2e message?
 }
 
@@ -1842,8 +1787,9 @@ func (r *ChannelRouter) sendPayment(payment *LightningPayment,
 			}
 
 			switch onionErr := fErr.FailureMessage.(type) {
-			// If the end destination didn't know they payment
-			// hash, then we'll terminate immediately.
+			// If the end destination didn't know the payment
+			// hash or we sent the wrong payment amount to the
+			// destination, then we'll terminate immediately.
 			case *lnwire.FailUnknownPaymentHash:
 				return preImage, nil, sendError
 
@@ -2059,18 +2005,26 @@ func (r *ChannelRouter) applyChannelUpdate(msg *lnwire.ChannelUpdate,
 		return true
 	}
 
-	if err := ValidateChannelUpdateAnn(pubKey, msg); err != nil {
+	ch, _, _, err := r.GetChannelByID(msg.ShortChannelID)
+	if err != nil {
+		log.Errorf("Unable to retrieve channel by id: %v", err)
+		return false
+	}
+
+	if err := ValidateChannelUpdateAnn(pubKey, ch.Capacity, msg); err != nil {
 		log.Errorf("Unable to validate channel update: %v", err)
 		return false
 	}
 
-	err := r.UpdateEdge(&channeldb.ChannelEdgePolicy{
+	err = r.UpdateEdge(&channeldb.ChannelEdgePolicy{
 		SigBytes:                  msg.Signature.ToSignatureBytes(),
 		ChannelID:                 msg.ShortChannelID.ToUint64(),
 		LastUpdate:                time.Unix(int64(msg.Timestamp), 0),
-		Flags:                     msg.Flags,
+		MessageFlags:              msg.MessageFlags,
+		ChannelFlags:              msg.ChannelFlags,
 		TimeLockDelta:             msg.TimeLockDelta,
 		MinHTLC:                   msg.HtlcMinimumMsat,
+		MaxHTLC:                   msg.HtlcMaximumMsat,
 		FeeBaseMSat:               lnwire.MilliSatoshi(msg.BaseFee),
 		FeeProportionalMillionths: lnwire.MilliSatoshi(msg.FeeRate),
 	})
@@ -2270,7 +2224,7 @@ func (r *ChannelRouter) IsKnownEdge(chanID lnwire.ShortChannelID) bool {
 //
 // NOTE: This method is part of the ChannelGraphSource interface.
 func (r *ChannelRouter) IsStaleEdgePolicy(chanID lnwire.ShortChannelID,
-	timestamp time.Time, flags lnwire.ChanUpdateFlag) bool {
+	timestamp time.Time, flags lnwire.ChanUpdateChanFlags) bool {
 
 	edge1Timestamp, edge2Timestamp, exists, err := r.cfg.Graph.HasChannelEdge(
 		chanID.ToUint64(),

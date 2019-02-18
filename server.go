@@ -24,13 +24,15 @@ import (
 	"github.com/btcsuite/btcutil"
 	"github.com/coreos/bbolt"
 	"github.com/go-errors/errors"
-	"github.com/lightningnetwork/lightning-onion"
+	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/brontide"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/channelnotifier"
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/discovery"
 	"github.com/lightningnetwork/lnd/htlcswitch"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnpeer"
@@ -144,6 +146,8 @@ type server struct {
 
 	invoices *invoices.InvoiceRegistry
 
+	channelNotifier *channelnotifier.ChannelNotifier
+
 	witnessBeacon contractcourt.WitnessBeacon
 
 	breachArbiter *breachArbiter
@@ -163,6 +167,8 @@ type server struct {
 	connMgr *connmgr.ConnManager
 
 	sigPool *lnwallet.SigPool
+
+	writeBufferPool *lnpeer.WriteBufferPool
 
 	// globalFeatures feature vector which affects HTLCs and thus are also
 	// advertised to other nodes.
@@ -259,13 +265,19 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 	sharedSecretPath := filepath.Join(graphDir, "sphinxreplay.db")
 	replayLog := htlcswitch.NewDecayedLog(sharedSecretPath, cc.chainNotifier)
 	sphinxRouter := sphinx.NewRouter(privKey, activeNetParams.Params, replayLog)
+	writeBufferPool := lnpeer.NewWriteBufferPool(
+		lnpeer.DefaultGCInterval, lnpeer.DefaultExpiryInterval,
+	)
 
 	s := &server{
-		chanDB:  chanDB,
-		cc:      cc,
-		sigPool: lnwallet.NewSigPool(runtime.NumCPU()*2, cc.signer),
+		chanDB:          chanDB,
+		cc:              cc,
+		sigPool:         lnwallet.NewSigPool(runtime.NumCPU()*2, cc.signer),
+		writeBufferPool: writeBufferPool,
 
 		invoices: invoices.NewRegistry(chanDB, activeNetParams.Params),
+
+		channelNotifier: channelnotifier.New(chanDB),
 
 		identityPriv: privKey,
 		nodeSigner:   netann.NewNodeSigner(privKey),
@@ -350,6 +362,8 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 			htlcswitch.DefaultFwdEventInterval),
 		LogEventTicker: ticker.New(
 			htlcswitch.DefaultLogInterval),
+		NotifyActiveChannel:   s.channelNotifier.NotifyActiveChannelEvent,
+		NotifyInactiveChannel: s.channelNotifier.NotifyInactiveChannelEvent,
 	}, uint32(currentHeight))
 	if err != nil {
 		return nil, err
@@ -728,7 +742,9 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 		DisableChannel: func(op wire.OutPoint) error {
 			return s.announceChanStatus(op, true)
 		},
-		Sweeper: s.sweeper,
+		Sweeper:             s.sweeper,
+		SettleInvoice:       s.invoices.SettleInvoice,
+		NotifyClosedChannel: s.channelNotifier.NotifyClosedChannelEvent,
 	}, chanDB)
 
 	s.breachArbiter = newBreachArbiter(&BreachConfig{
@@ -912,11 +928,12 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 		RequiredRemoteMaxHTLCs: func(chanAmt btcutil.Amount) uint16 {
 			// By default, we'll permit them to utilize the full
 			// channel bandwidth.
-			return uint16(lnwallet.MaxHTLCNumber / 2)
+			return uint16(input.MaxHTLCNumber / 2)
 		},
-		ZombieSweeperInterval: 1 * time.Minute,
-		ReservationTimeout:    10 * time.Minute,
-		MinChanSize:           btcutil.Amount(cfg.MinChanSize),
+		ZombieSweeperInterval:  1 * time.Minute,
+		ReservationTimeout:     10 * time.Minute,
+		MinChanSize:            btcutil.Amount(cfg.MinChanSize),
+		NotifyOpenChannelEvent: s.channelNotifier.NotifyOpenChannelEvent,
 	})
 	if err != nil {
 		return nil, err
@@ -976,6 +993,9 @@ func (s *server) Start() error {
 		return err
 	}
 	if err := s.cc.chainNotifier.Start(); err != nil {
+		return err
+	}
+	if err := s.channelNotifier.Start(); err != nil {
 		return err
 	}
 	if err := s.sphinx.Start(); err != nil {
@@ -1075,6 +1095,7 @@ func (s *server) Stop() error {
 	s.authGossiper.Stop()
 	s.chainArb.Stop()
 	s.sweeper.Stop()
+	s.channelNotifier.Stop()
 	s.cc.wallet.Shutdown()
 	s.cc.chainView.Stop()
 	s.connMgr.Stop()
@@ -1672,19 +1693,39 @@ func (s *server) establishPersistentConnections() error {
 	if err != nil {
 		return err
 	}
+
 	// TODO(roasbeef): instead iterate over link nodes and query graph for
 	// each of the nodes.
+	selfPub := s.identityPriv.PubKey().SerializeCompressed()
 	err = sourceNode.ForEachChannel(nil, func(
-		_ *bbolt.Tx,
-		_ *channeldb.ChannelEdgeInfo,
+		tx *bbolt.Tx,
+		chanInfo *channeldb.ChannelEdgeInfo,
 		policy, _ *channeldb.ChannelEdgePolicy) error {
 
-		pubStr := string(policy.Node.PubKeyBytes[:])
+		// If the remote party has announced the channel to us, but we
+		// haven't yet, then we won't have a policy. However, we don't
+		// need this to connect to the peer, so we'll log it and move on.
+		if policy == nil {
+			srvrLog.Warnf("No channel policy found for "+
+				"ChannelPoint(%v): ", chanInfo.ChannelPoint)
+		}
 
-		// Add all unique addresses from channel graph/NodeAnnouncements
-		// to the list of addresses we'll connect to for this peer.
+		// We'll now fetch the peer opposite from us within this
+		// channel so we can queue up a direct connection to them.
+		channelPeer, err := chanInfo.FetchOtherNode(tx, selfPub)
+		if err != nil {
+			return fmt.Errorf("unable to fetch channel peer for "+
+				"ChannelPoint(%v): %v", chanInfo.ChannelPoint,
+				err)
+		}
+
+		pubStr := string(channelPeer.PubKeyBytes[:])
+
+		// Add all unique addresses from channel
+		// graph/NodeAnnouncements to the list of addresses we'll
+		// connect to for this peer.
 		addrSet := make(map[string]net.Addr)
-		for _, addr := range policy.Node.Addresses {
+		for _, addr := range channelPeer.Addresses {
 			switch addr.(type) {
 			case *net.TCPAddr:
 				addrSet[addr.String()] = addr
@@ -1726,7 +1767,7 @@ func (s *server) establishPersistentConnections() error {
 		n := &nodeAddresses{
 			addresses: addrs,
 		}
-		n.pubKey, err = policy.Node.PubKey()
+		n.pubKey, err = channelPeer.PubKey()
 		if err != nil {
 			return err
 		}
@@ -2368,7 +2409,7 @@ func (s *server) peerConnected(conn net.Conn, connReq *connmgr.ConnReq,
 
 	// We'll signal that we understand the data loss protection feature,
 	// and also that we support the new gossip query features.
-	localFeatures.Set(lnwire.DataLossProtectOptional)
+	localFeatures.Set(lnwire.DataLossProtectRequired)
 	localFeatures.Set(lnwire.GossipQueriesOptional)
 
 	// Now that we've established a connection, create a peer, and it to
@@ -2468,7 +2509,7 @@ func (s *server) peerInitializer(p *peer) {
 	defer s.mu.Unlock()
 
 	// Check if there are listeners waiting for this peer to come online.
-	srvrLog.Debugf("Notifying that peer %x is offline", p.PubKey())
+	srvrLog.Debugf("Notifying that peer %x is online", p.PubKey())
 	for _, peerChan := range s.peerConnectedListeners[pubStr] {
 		select {
 		case peerChan <- p:
@@ -2978,10 +3019,10 @@ func (s *server) announceChanStatus(op wire.OutPoint, disabled bool) error {
 
 	if disabled {
 		// Set the bit responsible for marking a channel as disabled.
-		chanUpdate.Flags |= lnwire.ChanUpdateDisabled
+		chanUpdate.ChannelFlags |= lnwire.ChanUpdateDisabled
 	} else {
 		// Clear the bit responsible for marking a channel as disabled.
-		chanUpdate.Flags &= ^lnwire.ChanUpdateDisabled
+		chanUpdate.ChannelFlags &= ^lnwire.ChanUpdateDisabled
 	}
 
 	// We must now update the message's timestamp and generate a new
@@ -3066,9 +3107,9 @@ func extractChannelUpdate(ownerPubKey []byte,
 	owner := func(edge *channeldb.ChannelEdgePolicy) []byte {
 		var pubKey *btcec.PublicKey
 		switch {
-		case edge.Flags&lnwire.ChanUpdateDirection == 0:
+		case edge.ChannelFlags&lnwire.ChanUpdateDirection == 0:
 			pubKey, _ = info.NodeKey1()
-		case edge.Flags&lnwire.ChanUpdateDirection == 1:
+		case edge.ChannelFlags&lnwire.ChanUpdateDirection == 1:
 			pubKey, _ = info.NodeKey2()
 		}
 
@@ -3100,9 +3141,11 @@ func createChannelUpdate(info *channeldb.ChannelEdgeInfo,
 		ChainHash:       info.ChainHash,
 		ShortChannelID:  lnwire.NewShortChanIDFromInt(policy.ChannelID),
 		Timestamp:       uint32(policy.LastUpdate.Unix()),
-		Flags:           policy.Flags,
+		MessageFlags:    policy.MessageFlags,
+		ChannelFlags:    policy.ChannelFlags,
 		TimeLockDelta:   policy.TimeLockDelta,
 		HtlcMinimumMsat: policy.MinHTLC,
+		HtlcMaximumMsat: policy.MaxHTLC,
 		BaseFee:         uint32(policy.FeeBaseMSat),
 		FeeRate:         uint32(policy.FeeProportionalMillionths),
 		ExtraOpaqueData: policy.ExtraOpaqueData,

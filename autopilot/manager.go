@@ -1,6 +1,7 @@
 package autopilot
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -264,6 +265,49 @@ func (m *Manager) StopAgent() error {
 	m.pilot = nil
 
 	log.Debugf("Manager stopped autopilot agent")
+
+	return nil
+}
+
+// QueryHeuristics queries the active autopilot agent for node scores.
+func (m *Manager) QueryHeuristics(nodes []NodeID) (HeuristicScores, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	// Not active, so we can return early.
+	if m.pilot == nil {
+		return nil, fmt.Errorf("autopilot not active")
+	}
+
+	n := make(map[NodeID]struct{})
+	for _, node := range nodes {
+		n[node] = struct{}{}
+	}
+
+	log.Debugf("Querying heuristics for %d nodes", len(n))
+	return m.pilot.queryHeuristics(n)
+}
+
+// SetNodeScores is used to set the scores of the given heuristic, if it is
+// active, and ScoreSettable.
+func (m *Manager) SetNodeScores(name string, scores map[NodeID]float64) error {
+	// It must be ScoreSettable to be available for external
+	// scores.
+	s, ok := m.cfg.PilotCfg.Heuristic.(ScoreSettable)
+	if !ok {
+		return fmt.Errorf("current heuristic doesn't support " +
+			"external scoring")
+	}
+
+	// Heuristic was found, set its node scores.
+	applied, err := s.SetNodeScores(name, scores)
+	if err != nil {
+		return err
+	}
+
+	if !applied {
+		return fmt.Errorf("heuristic with name %v not found", name)
+	}
 
 	return nil
 }

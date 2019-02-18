@@ -16,6 +16,7 @@ import (
 	"github.com/btcsuite/btcutil"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/chainview"
@@ -87,7 +88,7 @@ func createChannelEdge(ctx *testCtx, bitcoinKey1, bitcoinKey2 []byte,
 	*lnwire.ShortChannelID, error) {
 
 	fundingTx := wire.NewMsgTx(2)
-	_, tx, err := lnwallet.GenFundingPkScript(
+	_, tx, err := input.GenFundingPkScript(
 		bitcoinKey1,
 		bitcoinKey2,
 		int64(chanValue),
@@ -402,9 +403,9 @@ func TestEdgeUpdateNotification(t *testing.T) {
 	// Create random policy edges that are stemmed to the channel id
 	// created above.
 	edge1 := randEdgePolicy(chanID, node1)
-	edge1.Flags = 0
+	edge1.ChannelFlags = 0
 	edge2 := randEdgePolicy(chanID, node2)
-	edge2.Flags = 1
+	edge2.ChannelFlags = 1
 
 	if err := ctx.router.UpdateEdge(edge1); err != nil {
 		t.Fatalf("unable to add edge update: %v", err)

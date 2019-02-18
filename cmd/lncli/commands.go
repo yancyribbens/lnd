@@ -257,14 +257,17 @@ var listUnspentCommand = cli.Command{
 	Name:      "listunspent",
 	Category:  "On-chain",
 	Usage:     "List utxos available for spending.",
-	ArgsUsage: "min-confs max-confs",
+	ArgsUsage: "[min-confs [max-confs]] [--unconfirmed_only]",
 	Description: `
 	For each spendable utxo currently in the wallet, with at least min_confs
-	confirmations, and at most max_confs confirmations, lists the txid, index,
-	amount, address, address type, scriptPubkey and number of confirmations.
-	Use --min_confs=0 to include unconfirmed coins. To list all coins
-	with at least min_confs confirmations, omit the second argument or flag
-	'--max_confs'.
+	confirmations, and at most max_confs confirmations, lists the txid,
+	index, amount, address, address type, scriptPubkey and number of
+	confirmations.  Use --min_confs=0 to include unconfirmed coins. To list
+	all coins with at least min_confs confirmations, omit the second
+	argument or flag '--max_confs'. To list all confirmed and unconfirmed
+	coins, no arguments are required. To see only unconfirmed coins, use 
+	'--unconfirmed_only' with '--min_confs' and '--max_confs' set to zero or
+	not present.
 	`,
 	Flags: []cli.Flag{
 		cli.Int64Flag{
@@ -274,6 +277,15 @@ var listUnspentCommand = cli.Command{
 		cli.Int64Flag{
 			Name:  "max_confs",
 			Usage: "the maximum number of confirmations for a utxo",
+		},
+		cli.BoolFlag{
+			Name: "unconfirmed_only",
+			Usage: "when min_confs and max_confs are zero, " +
+				"setting false implicitly overrides max_confs " +
+				"to be MaxInt32, otherwise max_confs remains " +
+				"zero. An error is returned if the value is " +
+				"true and both min_confs and max_confs are " +
+				"non-zero. (defualt: false)",
 		},
 	},
 	Action: actionDecorator(listUnspent),
@@ -286,11 +298,6 @@ func listUnspent(ctx *cli.Context) error {
 		err         error
 	)
 	args := ctx.Args()
-
-	if ctx.NArg() == 0 && ctx.NumFlags() == 0 {
-		cli.ShowCommandHelp(ctx, "listunspent")
-		return nil
-	}
 
 	if ctx.IsSet("max_confs") && !ctx.IsSet("min_confs") {
 		return fmt.Errorf("max_confs cannot be set without " +
@@ -307,8 +314,6 @@ func listUnspent(ctx *cli.Context) error {
 			return nil
 		}
 		args = args.Tail()
-	default:
-		return fmt.Errorf("minimum confirmations argument missing")
 	}
 
 	switch {
@@ -321,15 +326,21 @@ func listUnspent(ctx *cli.Context) error {
 			return nil
 		}
 		args = args.Tail()
-	default:
-		// No maxconfs was specified; we use max as flag;
-		// the default for ctx.Int64 (0) is *not* appropriate here.
-		maxConfirms = math.MaxInt32
 	}
 
-	if minConfirms < 0 || maxConfirms < minConfirms {
-		return fmt.Errorf("maximum confirmations must be greater or " +
-			"equal to minimum confirmations")
+	unconfirmedOnly := ctx.Bool("unconfirmed_only")
+
+	// Force minConfirms and maxConfirms to be zero if unconfirmedOnly is
+	// true.
+	if unconfirmedOnly && (minConfirms != 0 || maxConfirms != 0) {
+		cli.ShowCommandHelp(ctx, "listunspent")
+		return nil
+	}
+
+	// When unconfirmedOnly is inactive, we will override maxConfirms to be
+	// a MaxInt32 to return all confirmed and unconfirmed utxos.
+	if maxConfirms == 0 && !unconfirmedOnly {
+		maxConfirms = math.MaxInt32
 	}
 
 	ctxb := context.Background()
@@ -340,11 +351,26 @@ func listUnspent(ctx *cli.Context) error {
 		MinConfs: int32(minConfirms),
 		MaxConfs: int32(maxConfirms),
 	}
-	jsonResponse, err := client.ListUnspent(ctxb, req)
+	resp, err := client.ListUnspent(ctxb, req)
 	if err != nil {
 		return err
 	}
-	printRespJSON(jsonResponse)
+
+	// Parse the response into the final json object that will be printed
+	// to stdout. At the moment, this filters out the raw txid bytes from
+	// each utxo's outpoint and only prints the txid string.
+	var listUnspentResp = struct {
+		Utxos []*Utxo `json:"utxos"`
+	}{
+		Utxos: make([]*Utxo, 0, len(resp.Utxos)),
+	}
+	for _, protoUtxo := range resp.Utxos {
+		utxo := NewUtxoFromProto(protoUtxo)
+		listUnspentResp.Utxos = append(listUnspentResp.Utxos, utxo)
+	}
+
+	printJSON(listUnspentResp)
+
 	return nil
 }
 
@@ -1936,6 +1962,12 @@ var sendPaymentCommand = cli.Command{
 			Name:  "final_cltv_delta",
 			Usage: "the number of blocks the last hop has to reveal the preimage",
 		},
+		cli.Uint64Flag{
+			Name: "outgoing_chan_id",
+			Usage: "short channel id of the outgoing channel to " +
+				"use for the first hop of the payment",
+			Value: 0,
+		},
 		cli.BoolFlag{
 			Name:  "force, f",
 			Usage: "will skip payment request confirmation",
@@ -2032,6 +2064,7 @@ func sendPayment(ctx *cli.Context) error {
 			PaymentRequest: ctx.String("pay_req"),
 			Amt:            ctx.Int64("amt"),
 			FeeLimit:       feeLimit,
+			OutgoingChanId: ctx.Uint64("outgoing_chan_id"),
 		}
 
 		return sendPaymentRequest(client, req)
@@ -2171,6 +2204,12 @@ var payInvoiceCommand = cli.Command{
 			Usage: "percentage of the payment's amount used as the" +
 				"maximum fee allowed when sending the payment",
 		},
+		cli.Uint64Flag{
+			Name: "outgoing_chan_id",
+			Usage: "short channel id of the outgoing channel to " +
+				"use for the first hop of the payment",
+			Value: 0,
+		},
 		cli.BoolFlag{
 			Name:  "force, f",
 			Usage: "will skip payment request confirmation",
@@ -2210,6 +2249,7 @@ func payInvoice(ctx *cli.Context) error {
 		PaymentRequest: payReq,
 		Amt:            ctx.Int64("amt"),
 		FeeLimit:       feeLimit,
+		OutgoingChanId: ctx.Uint64("outgoing_chan_id"),
 	}
 	return sendPaymentRequest(client, req)
 }
