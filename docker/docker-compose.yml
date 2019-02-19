@@ -38,7 +38,7 @@ services:
       extends: lnd
       container_name: lnd_btc
       links:
-          - "btcd:blockchain"
+        - "btcd:blockchain"
 
 volumes:
   # shared volume is need to store the btcd rpc certificates and use it within
