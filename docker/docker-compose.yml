@@ -1,28 +1,23 @@
 version: '2'
 services:
-
     # btc is an image of bitcoin node which used as base image for btcd and
     # btccli. The environment variables default values determined on stage of
     # container start within starting script.
-    btc:
+    btcd:
       image: btcd
+      container_name: btcd
       build:
         context: btcd/
       volumes:
-            - shared:/rpc
-            - bitcoin:/data
+        - shared:/rpc
+        - bitcoin:/data
       environment:
         - RPCUSER
         - RPCPASS
         - NETWORK
-
-    btcd:
-        extends: btc
-        container_name: btcd
-        environment:
-          - DEBUG
-          - MINING_ADDRESS
-        entrypoint: ["./start-btcd.sh"]
+        - DEBUG
+        - MINING_ADDRESS
+      entrypoint: ["./start-btcd.sh"]
 
     lnd:
         image: lnd
@@ -36,7 +31,7 @@ services:
           - CHAIN
           - DEBUG
         volumes:
-            - shared:/rpc
+          - shared:/rpc
         entrypoint: ["./start-lnd.sh"]
 
     lnd_btc:
